@@ -1,0 +1,98 @@
+{
+  "description": "Reports this session's events to Keo over your own signed-in Keo connection. When a turn ends, Keo can hand Claude a message you sent from Slack; when Claude asks for permission, Keo can carry your Allow or Deny back from Slack.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "plugin:keo:keo",
+            "tool": "coding_session_event",
+            "timeout": 15,
+            "input": {
+              "session_id": "${session_id}",
+              "event": "${hook_event_name}",
+              "cwd": "${cwd}",
+              "text": "${prompt}"
+            }
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "plugin:keo:keo",
+            "tool": "coding_session_event",
+            "timeout": 15,
+            "input": {
+              "session_id": "${session_id}",
+              "event": "${hook_event_name}",
+              "cwd": "${cwd}",
+              "text": "${last_assistant_message}",
+              "stop_hook_active": "${stop_hook_active}"
+            }
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "plugin:keo:keo",
+            "tool": "coding_session_event",
+            "timeout": 60,
+            "input": {
+              "session_id": "${session_id}",
+              "event": "${hook_event_name}",
+              "cwd": "${cwd}",
+              "text": "${tool_name}",
+              "preview": "${tool_input.command}${tool_input.file_path}"
+            }
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "plugin:keo:keo",
+            "tool": "coding_session_event",
+            "timeout": 15,
+            "input": {
+              "session_id": "${session_id}",
+              "event": "${hook_event_name}",
+              "cwd": "${cwd}",
+              "text": "${message}",
+              "detail": "${notification_type}"
+            }
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "plugin:keo:keo",
+            "tool": "coding_session_event",
+            "timeout": 15,
+            "input": {
+              "session_id": "${session_id}",
+              "event": "${hook_event_name}",
+              "cwd": "${cwd}",
+              "detail": "${reason}"
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

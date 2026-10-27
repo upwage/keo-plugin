@@ -1,0 +1,5 @@
+{
+  "mcpServers": {
+    "keo": { "type": "http", "url": "https://askkeo.ai/api/mcp" }
+  }
+}

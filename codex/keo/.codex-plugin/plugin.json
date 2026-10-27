@@ -1,0 +1,13 @@
+{
+  "name": "keo",
+  "version": "0.1.0",
+  "description": "Keo, your AI teammate in Slack, sees your Codex sessions. Send them work and answer their permission prompts from Slack.",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Keo",
+    "shortDescription": "See and drive your Codex sessions from Slack.",
+    "developerName": "Upwage",
+    "category": "Productivity",
+    "websiteURL": "https://askkeo.ai"
+  }
+}

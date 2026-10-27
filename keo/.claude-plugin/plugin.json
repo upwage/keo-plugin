@@ -1,0 +1,8 @@
+{
+  "name": "keo",
+  "version": "0.1.0",
+  "description": "Keo, your AI teammate in Slack, sees your Claude Code sessions. Send them work and answer their permission prompts from Slack.",
+  "author": { "name": "Upwage" },
+  "homepage": "https://github.com/upwage/keo-plugin",
+  "license": "MIT"
+}

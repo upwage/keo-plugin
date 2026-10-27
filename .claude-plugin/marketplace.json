@@ -1,0 +1,14 @@
+{
+  "name": "keo-plugin",
+  "owner": { "name": "Upwage" },
+  "metadata": {
+    "description": "Keo, your AI teammate in Slack, for Claude Code."
+  },
+  "plugins": [
+    {
+      "name": "keo",
+      "source": "./keo",
+      "description": "Keo, your AI teammate in Slack, sees your Claude Code sessions. Send them work and answer their permission prompts from Slack."
+    }
+  ]
+}

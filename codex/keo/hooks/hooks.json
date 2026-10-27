@@ -1,0 +1,83 @@
+{
+  "description": "Reports this session's events to Keo over your own signed-in Keo connection. When a turn ends, Keo can hand Codex a message you sent from Slack; when Codex asks for permission, Keo can carry your Allow or Deny back from Slack.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "keo",
+            "tool": "coding_session_event",
+            "timeout": 15,
+            "input": {
+              "agent": "codex",
+              "session_id": "${session_id}",
+              "event": "${hook_event_name}",
+              "cwd": "${cwd}",
+              "detail": "${source}"
+            }
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "keo",
+            "tool": "coding_session_event",
+            "timeout": 15,
+            "input": {
+              "agent": "codex",
+              "session_id": "${session_id}",
+              "event": "${hook_event_name}",
+              "cwd": "${cwd}",
+              "text": "${prompt}"
+            }
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "keo",
+            "tool": "coding_session_event",
+            "timeout": 15,
+            "input": {
+              "agent": "codex",
+              "session_id": "${session_id}",
+              "event": "${hook_event_name}",
+              "cwd": "${cwd}",
+              "text": "${last_assistant_message}",
+              "stop_hook_active": "${stop_hook_active}"
+            }
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "keo",
+            "tool": "coding_session_event",
+            "timeout": 60,
+            "input": {
+              "agent": "codex",
+              "session_id": "${session_id}",
+              "event": "${hook_event_name}",
+              "cwd": "${cwd}",
+              "text": "${tool_name}",
+              "preview": "${tool_name} ${tool_input}"
+            }
+          }
+        ]
+      }
+    ]
+  }
+}
