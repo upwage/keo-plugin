@@ -65,11 +65,13 @@ Everything goes over your own signed-in connection to Keo, so Keo knows each rep
 
 The reports above are calls Claude Code makes to Keo's tools; none of them runs a command on your
 machine. The plugin adds one command, for Claude Code only. After each turn ends, Claude Code runs it
-in the background for up to an hour:
+in the background for up to a day (it stops sooner when the session's next turn starts):
 
 - It sends this session's id, and nothing else, to `https://askkeo.ai/api/mcp/doorbell` with
   `curl`, and asks whether a message you approved in Slack is waiting. No token or other secret is
-  sent, and no message text comes back: Keo answers only "ring" or "wait".
+  sent, and no message text comes back: Keo answers only "ring" or "wait". Each check also tells
+  Keo that the session can be woken, so before you approve a message Keo can say whether it will
+  wake the session or wait for the next turn you start.
 - When Keo answers "ring", the command ends and Claude Code wakes the idle session with a short note
   that a message from you is waiting. The session ends that turn, and the plugin's usual end-of-turn
   report then hands it your message, over your signed-in connection.
