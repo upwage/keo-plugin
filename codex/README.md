@@ -39,8 +39,10 @@ That's it. Start Codex as usual. In Slack, ask Keo "what are my Codex sessions d
 - **See your sessions.** Each session shows its folder, its state (working, waiting for permission,
   finished, idle or stale), what you last asked, and Codex's last answer.
 - **Send a session work.** Tell Keo in Slack, for example "tell the api session to add a test".
-  Keo hands Codex your message when the session's current turn ends, and posts Codex's answer back
-  to the Slack thread. Keo tells you "Delivered" only once Codex has started on it.
+  Keo first shows you the exact message on an approval card, and nothing is sent until you press
+  Allow; each message is approved on its own. Keo hands Codex your message when the session's
+  current turn ends, and posts Codex's answer back to the Slack thread. Keo tells you "Delivered"
+  only once Codex has started on it.
 - **Answer a permission prompt.** In a turn you started from Slack, Keo posts Codex's permission
   request to the thread with Allow and Deny. If no one answers in time, it is denied. In a turn you
   started at the keyboard, Codex asks you in the terminal as usual.
@@ -52,6 +54,8 @@ Only you can see or drive your sessions. Your teammates, and Keo's own automatio
 - **After a plugin update, trust the hooks again.** Codex trusts a hook by its exact definition.
   If an update changes a hook, Codex skips that hook until you trust it again in `/hooks`. Until
   then, Keo stops hearing from your sessions.
+- **An idle session waits for its next turn.** Codex cannot wake an idle session from a plugin, so
+  a message sent to a session that is not working reaches it when you next start a turn there.
 - **A closed session shows as stale, not ended.** Codex does not let a plugin report a session's end
   to Keo, so a session you closed goes stale after two hours of silence.
 - **`codex exec` runs never ask for permission,** so Keo has no prompt to answer there. Keo still
