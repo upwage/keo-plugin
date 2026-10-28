@@ -41,9 +41,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "command -v curl >/dev/null 2>&1 || exit 0; set -f; IFS=; sid=$(cat | grep -o 'session_id[^A-Za-z0-9_-]*[A-Za-z0-9_-]*' | head -n 1 | sed 's|^session_id[^A-Za-z0-9_-]*||'); case $sid in ????????*) ;; *) exit 0;; esac; t=$TMPDIR; case $t in '') t=/tmp;; esac; f=$t/keo-doorbell-$(echo $sid | cksum | cut -d ' ' -f 1); w=$(date +%s)-$$; echo $w > $f || exit 0; end=$(( $(date +%s) + 3500 )); while [ $(date +%s) -lt $end ]; do case $(cat $f 2>/dev/null) in $w) ;; *) exit 0;; esac; r=$(echo session_id=$sid | curl -q -sf -m 70 --data @- https://askkeo.ai/api/mcp/doorbell); case $r in ring) echo 'Keo: the owner of this session sent it a message from Slack, and the message is waiting. End this turn now with one short line and no other action; Keo delivers the message as soon as the turn ends.' >&2; exit 2;; wait) ;; *) sleep 60;; esac; done; exit 0",
+            "command": "command -v curl >/dev/null 2>&1 || exit 0; set -f; IFS=; sid=$(cat | grep -o 'session_id[^A-Za-z0-9_-]*[A-Za-z0-9_-]*' | head -n 1 | sed 's|^session_id[^A-Za-z0-9_-]*||'); case $sid in ????????*) ;; *) exit 0;; esac; t=$TMPDIR; case $t in '') t=/tmp;; esac; f=$t/keo-doorbell-$(echo $sid | cksum | cut -d ' ' -f 1); w=$(date +%s)-$$; echo $w > $f || exit 0; end=$(( $(date +%s) + 86000 )); while [ $(date +%s) -lt $end ]; do case $(cat $f 2>/dev/null) in $w) ;; *) exit 0;; esac; r=$(echo session_id=$sid | curl -q -sf -m 70 --data @- https://askkeo.ai/api/mcp/doorbell); case $r in ring) echo 'Keo: the owner of this session sent it a message from Slack, and the message is waiting. End this turn now with one short line and no other action; Keo delivers the message as soon as the turn ends.' >&2; exit 2;; wait) ;; *) sleep 60;; esac; done; exit 0",
             "asyncRewake": true,
-            "timeout": 3600
+            "timeout": 86400
           }
         ]
       }
