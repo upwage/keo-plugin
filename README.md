@@ -6,8 +6,11 @@ and you can steer them from Slack:
 - **See what your sessions are doing.** Ask Keo "what are my coding sessions doing?" For each
   session it shows the folder, whether it is working, waiting for your permission or finished, what
   you last asked, and the assistant's last reply.
-- **Send a session work.** Tell Keo what a session should do next. The session gets your message
-  when it next finishes a turn, and its reply comes back to the same Slack thread.
+- **Send a session work.** Tell Keo what a session should do next. Keo first shows you the exact
+  message on an approval card in Slack, and nothing is sent until you press Allow. Each message is
+  approved on its own. A session that is working gets the message when its current turn ends. An
+  idle Claude Code session is woken to take it at once; an idle Codex session gets it at the end of
+  its next turn. The session's reply comes back to the same Slack thread.
 - **Answer permission prompts.** During a turn that a message from Slack started, when the session
   asks to run a command or edit a file, Keo shows you the request in that Slack thread with Allow
   and Deny buttons. If nobody answers in time, the request is denied. During a turn you started at
@@ -26,7 +29,8 @@ claude plugin install keo@keo-plugin
 ```
 
 Then sign in once. In Claude Code, run `/mcp`, choose `plugin:keo:keo`, then **Authenticate**, and
-sign in with Slack in the browser window that opens. Until you sign in, the plugin sends nothing.
+sign in with Slack in the browser window that opens. Until you sign in, the only thing the plugin
+sends is the wake check's session id (see below), and Keo knows nothing to answer it with.
 
 ## Install for Codex
 
@@ -56,6 +60,27 @@ it. Keo does not read your files or your code. It sees only what is listed here,
 code if your prompts, the assistant's replies or a tool's input contain some.
 
 Everything goes over your own signed-in connection to Keo, so Keo knows each report is yours.
+
+## The one command it runs (Claude Code)
+
+The reports above are calls Claude Code makes to Keo's tools; none of them runs a command on your
+machine. The plugin adds one command, for Claude Code only. After each turn ends, Claude Code runs it
+in the background for up to an hour:
+
+- It sends this session's id, and nothing else, to `https://askkeo.ai/api/mcp/doorbell` with
+  `curl`, and asks whether a message you approved in Slack is waiting. No token or other secret is
+  sent, and no message text comes back: Keo answers only "ring" or "wait".
+- When Keo answers "ring", the command ends and Claude Code wakes the idle session with a short note
+  that a message from you is waiting. The session ends that turn, and the plugin's usual end-of-turn
+  report then hands it your message, over your signed-in connection.
+- It keeps one small file in your temp folder, named by a checksum of the session id, so that a newer
+  check replaces the older one instead of running beside it. The id is never in a file name or in
+  the command's arguments.
+
+Keo answers "ring" only for a message you approved, and only while the session is between turns,
+at most three times per message, two minutes apart. The check needs `curl` and a POSIX shell: macOS, Linux, and Windows with Git Bash
+(which Claude Code uses there). Without them it does nothing, and a message waits for the end of the
+session's next turn.
 
 ## Only you can drive your sessions
 
