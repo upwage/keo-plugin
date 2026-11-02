@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-add-dir"
+description = "Enables the add_dir command without any pre-configured scope."
+commands.allow = ["add_dir"]
+
+[[permission]]
+identifier = "deny-add-dir"
+description = "Denies the add_dir command without any pre-configured scope."
+commands.deny = ["add_dir"]

@@ -1,0 +1,19 @@
+{
+  "name": "keo-companion",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Keo Companion: a menu-bar app that connects Keo to the coding agents on this machine.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/copy-static.mjs",
+    "icons": "node scripts/gen-icons.mjs",
+    "tauri": "tauri",
+    "dev": "node scripts/dev.mjs",
+    "dev:staging": "node scripts/dev.mjs --config ../staging/companion/tauri.conf.json"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.4",
+    "typescript": "5.9.3"
+  }
+}

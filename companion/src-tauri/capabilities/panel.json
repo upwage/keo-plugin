@@ -1,0 +1,21 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "panel",
+  "description": "The panel window: the app's own commands and status events, nothing else.",
+  "windows": ["panel"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-get-status",
+    "allow-sign-in",
+    "allow-sign-out",
+    "allow-set-paused",
+    "allow-set-start-at-login",
+    "allow-add-dir",
+    "allow-remove-dir",
+    "allow-log-tail",
+    "allow-open-url",
+    "allow-quit",
+    "allow-cancel-sign-in"
+  ]
+}
