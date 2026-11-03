@@ -133,6 +133,44 @@ impl Fake {
     fn close(&mut self) {
         self.to_client = None;
     }
+
+    /// The `config/read` before a new thread, answered with an empty effective config.
+    async fn config_read(&mut self, cwd: &str) {
+        self.config_read_with(cwd, json!({})).await;
+    }
+
+    async fn config_read_with(&mut self, cwd: &str, config: Value) {
+        let read = self.expect("config/read").await;
+        assert_eq!(read["params"], json!({"cwd": cwd}));
+        self.reply(&read, json!({"config": config}));
+    }
+
+    /// The `thread/read` before a resume, answered with `thread`.
+    async fn read_before_resume(&mut self, thread: Value) {
+        let read = self.expect("thread/read").await;
+        assert_eq!(
+            read["params"],
+            json!({"threadId": THREAD, "includeTurns": false})
+        );
+        self.reply(&read, json!({"thread": thread}));
+    }
+}
+
+/// The overrides a Keo-started thread gets with an empty effective config.
+fn base_config() -> serde_json::Map<String, Value> {
+    // Keys built from the plugin ids: a whole `id.enabled` key reads as an email to the
+    // publish guard.
+    let mut config: serde_json::Map<String, Value> =
+        ["computer-use", "unified-computer-use", "chrome", "browser"]
+            .iter()
+            .map(|id| (format!("plugins.{id}@openai-bundled.enabled"), json!(false)))
+            .collect();
+    // No Keo plugin is on, so plugins are off as a whole as well.
+    config.insert("features.plugins".into(), json!(false));
+    config.insert("features.apps".into(), json!(false));
+    // One Slack Allow covers the session: no approvals, writes in the folder, network on.
+    config.insert("sandbox_workspace_write.network_access".into(), json!(true));
+    config
 }
 
 /// The next event that is not a roster change.
@@ -186,6 +224,117 @@ async fn connect(fake: &mut Fake, runner: &CodexRunner) {
     assert_eq!(res.unwrap(), Vec::new());
 }
 
+#[test]
+fn a_server_a_dotted_key_cannot_switch_off_stops_the_start() {
+    // Kills: a server left on because its name could not be written as an override key.
+    let policy = SessionPolicy::default();
+    let config = json!({"mcp_servers": {"a.b": {"command": "x"}}});
+    assert!(lean_config(&config, &policy).is_err());
+    // The Keo entry under any name stays on, whatever its name holds.
+    let config = json!({"mcp_servers": {"my.keo": {"url": "https://askkeo.ai/api/mcp"}}});
+    assert!(lean_config(&config, &policy).is_ok());
+}
+
+#[test]
+fn only_the_keo_plugin_for_the_policy_origin_stays_on() {
+    // Kills: a production session loading the team variant's MCP server, or the reverse.
+    let at = "@";
+    let (prod_id, beta_id) = (
+        format!("keo{at}keo-plugin"),
+        format!("keo-beta{at}keo-beta"),
+    );
+    let mut plugins = serde_json::Map::new();
+    for id in [&prod_id, &beta_id] {
+        plugins.insert(id.clone(), json!({"enabled": true}));
+    }
+    let config = json!({ "plugins": plugins });
+    let off = |policy: &SessionPolicy| -> Vec<String> {
+        let out = lean_config(&config, policy).unwrap();
+        [&prod_id, &beta_id]
+            .into_iter()
+            .filter(|id| out.get(format!("plugins.{id}.enabled")) == Some(&json!(false)))
+            .cloned()
+            .collect()
+    };
+    assert_eq!(off(&SessionPolicy::default()), vec![beta_id.clone()]);
+    let beta = SessionPolicy::for_keo(
+        &crate::keo::BaseUrl::parse_allowed("https://beta.askkeo.ai").unwrap(),
+    );
+    assert_eq!(off(&beta), vec![prod_id.clone()]);
+}
+
+#[tokio::test]
+async fn a_file_change_approval_shows_only_its_own_live_diff() {
+    // Kills: a diff kept past its item (or its connection) shown for a later approval.
+    let mut fake = fake().await;
+    let runner = fake.runner();
+    let mut rx = runner.events();
+    connect(&mut fake, &runner).await;
+    let started = json!({"method": "item/started", "params": {"threadId": THREAD, "item": {
+        "type": "fileChange", "id": "fc-1",
+        "changes": [{"path": "a.rs", "kind": {"type": "update"}, "diff": "+new line"}]}}});
+    let ask = |id: u64| {
+        json!({"id": id, "method": "item/fileChange/requestApproval", "params": {
+        "threadId": THREAD, "turnId": "u", "itemId": "fc-1", "startedAtMs": 1}})
+    };
+    fake.send(started);
+    fake.send(ask(5));
+    let (_, text, options) = question(next(&mut rx).await);
+    assert!(text.contains("+new line"), "{text}");
+    assert!(options.contains(&"Allow".to_string()));
+    fake.send(
+        json!({"method": "item/completed", "params": {"threadId": THREAD, "item": {
+        "type": "fileChange", "id": "fc-1", "changes": []}}}),
+    );
+    fake.send(ask(6));
+    let (_, text, options) = question(next(&mut rx).await);
+    assert!(!text.contains("+new line"), "{text}");
+    assert!(!options.contains(&"Allow".to_string()), "{options:?}");
+}
+
+#[test]
+fn a_config_reply_of_the_wrong_shape_stops_the_start() {
+    // Kills: a missing or malformed config read as empty, which keeps every server on.
+    let policy = SessionPolicy::default();
+    for bad in [
+        Value::Null,
+        json!([]),
+        json!("x"),
+        json!({"mcp_servers": []}),
+        json!({"mcp_servers": {"drive": "drive-mcp"}}),
+        json!({"mcp_servers": {"drive": {"command": "d", "enabled": "yes"}}}),
+        json!({"plugins": ["figma"]}),
+        json!({"plugins": {"figma": true}}),
+    ] {
+        assert!(lean_config(&bad, &policy).is_err(), "{bad}");
+    }
+    assert!(lean_config(&json!({}), &policy).is_ok());
+}
+
+#[tokio::test]
+async fn a_config_reply_without_a_config_fails_the_start() {
+    let mut fake = fake().await;
+    let runner = fake.runner();
+    let server = async {
+        fake.handshake().await;
+        let read = fake.expect("config/read").await;
+        fake.reply(&read, json!({}));
+    };
+    let req = StartRequest {
+        cwd: PathBuf::from("/work/repo"),
+        name: Some("n".into()),
+        slack_thread: None,
+    };
+    let (res, ()) = tokio::join!(runner.start(req), server);
+    assert!(res.unwrap_err().to_string().contains("not isolated"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), fake.from_client.recv())
+            .await
+            .is_err(),
+        "no thread/start after a config that could not be checked"
+    );
+}
+
 #[tokio::test]
 async fn start_session_then_approval_progress_usage_and_turn_end() {
     let mut fake = fake().await;
@@ -198,18 +347,40 @@ async fn start_session_then_approval_progress_usage_and_turn_end() {
     };
     let server = async {
         fake.handshake().await;
+        // The person's own MCP servers and plugins: only their Keo entry and Keo's plugin stay.
+        let at = "@";
+        let mut plugins = serde_json::Map::new();
+        plugins.insert(format!("figma{at}some-market"), json!({"enabled": true}));
+        plugins.insert(format!("keo{at}keo-plugin"), json!({"enabled": true}));
+        // Keo's plugin name from another marketplace is not Keo's plugin.
+        plugins.insert(format!("keo{at}other-market"), json!({"enabled": true}));
+        fake.config_read_with(
+            "/work/repo",
+            json!({
+                "mcp_servers": {
+                    "keo": {"url": "https://askkeo.ai/api/mcp/", "enabled": true},
+                    "drive": {"command": "drive-mcp", "enabled": true},
+                    "old": {"url": "https://example.com/mcp", "enabled": false},
+                },
+                "plugins": plugins,
+            }),
+        )
+        .await;
         let start = fake.expect("thread/start").await;
-        // Keys built from the plugin ids: a whole `id.enabled` key reads as an email to the
-        // publish guard.
-        let off: serde_json::Map<String, Value> =
-            ["computer-use", "unified-computer-use", "chrome", "browser"]
-                .iter()
-                .map(|id| (format!("plugins.{id}@openai-bundled.enabled"), json!(false)))
-                .collect();
+        let mut config = base_config();
+        // Keo's own plugin is on, so plugins stay on as a whole and each other one is named.
+        config.remove("features.plugins");
+        config.insert("mcp_servers.drive.enabled".into(), json!(false));
+        for id in ["figma{at}some-market", "keo{at}other-market"] {
+            config.insert(
+                format!("plugins.{}.enabled", id.replace("{at}", at)),
+                json!(false),
+            );
+        }
         assert_eq!(
             start["params"],
-            json!({"cwd": "/work/repo", "approvalPolicy": "on-request", "sandbox": "workspace-write",
-            "config": off})
+            json!({"cwd": "/work/repo", "approvalPolicy": "never", "sandbox": "workspace-write",
+            "config": config})
         );
         fake.replay(&start, 10);
         let name = fake.expect("thread/name/set").await;
@@ -233,6 +404,12 @@ async fn start_session_then_approval_progress_usage_and_turn_end() {
         fake.reply(&name, json!({}));
         let turn = fake.expect("turn/start").await;
         assert_eq!(turn["params"]["threadId"], THREAD);
+        // Every turn repeats the policy, so a thread resumed after a restart keeps it.
+        assert_eq!(turn["params"]["approvalPolicy"], "never");
+        assert_eq!(
+            turn["params"]["sandboxPolicy"],
+            json!({"type": "workspaceWrite", "networkAccess": true})
+        );
         assert_eq!(
             turn["params"]["input"][0]["text"],
             "Fix ABC-42: run the date command"
@@ -390,8 +567,14 @@ async fn roster_lists_recent_threads_with_their_real_folders() {
         fake.reply(&req, json!({"data": [recent, old]}));
     };
     let (res, ()) = tokio::join!(runner.list(), server);
+    let list = res.unwrap();
+    let active_at = list.first().and_then(|e| e.active_at);
+    assert!(
+        active_at >= Some(now_secs() - 60),
+        "the thread's newest time orders the panel"
+    );
     assert_eq!(
-        res.unwrap(),
+        list,
         vec![RosterEntry {
             tool: KIND,
             session_id: THREAD.into(),
@@ -399,6 +582,7 @@ async fn roster_lists_recent_threads_with_their_real_folders() {
             name: "keo-spike-codex-1".into(),
             state: crate::runner::SessionState::WaitingPermission,
             pid: None,
+            active_at,
         }]
     );
 }
@@ -466,7 +650,10 @@ async fn send_resumes_then_starts_and_steer_follows_the_running_turn() {
     let runner = fake.runner();
     let server = async {
         fake.handshake().await;
+        fake.read_before_resume(spike(10)["result"]["thread"].clone())
+            .await;
         let resume = fake.expect("thread/resume").await;
+        // Another app's thread loads with the person's own config.
         assert_eq!(
             resume["params"],
             json!({"threadId": THREAD, "excludeTurns": true})
@@ -476,6 +663,8 @@ async fn send_resumes_then_starts_and_steer_follows_the_running_turn() {
             json!({"thread": spike(10)["result"]["thread"].clone()}),
         );
         let turn = fake.expect("turn/start").await;
+        // A thread the companion did not create keeps the person's own approvals.
+        assert!(turn["params"].get("approvalPolicy").is_none());
         fake.replay(&turn, 38);
     };
     let (res, ()) = tokio::join!(runner.send(THREAD, "next step"), server);
@@ -556,6 +745,46 @@ async fn closed_server_ends_the_running_turn() {
 }
 
 #[tokio::test]
+async fn frames_buffered_by_an_older_connection_reach_no_handler() {
+    let mut fake = fake().await;
+    let runner = fake.runner();
+    let mut rx = runner.events();
+    connect(&mut fake, &runner).await;
+    let (old, conn) = runner.inner.conn().await.unwrap();
+    // A newer connection is made while the old one still has a turn start and an ask buffered.
+    *runner.inner.generation.lock().unwrap() += 1;
+    let (tx, inbound) = mpsc::unbounded_channel();
+    let Value::Object(started) = spike(41) else {
+        panic!("spike 41")
+    };
+    tx.send(rpc::Inbound::Notification {
+        method: started["method"].as_str().unwrap().into(),
+        params: started["params"].clone(),
+    })
+    .unwrap();
+    tx.send(rpc::Inbound::Request {
+        id: json!(99),
+        method: "item/commandExecution/requestApproval".into(),
+        params: json!({"threadId": THREAD, "turnId": "t", "itemId": "i", "cwd": "/r", "command": "ls"}),
+    })
+    .unwrap();
+    drop(tx);
+    pump(Arc::downgrade(&runner.inner), old, conn, inbound).await;
+    let st = runner.inner.st();
+    assert!(st.threads.get(THREAD).map_or(true, |l| l.turn.is_none()));
+    assert!(st.prompts.is_empty());
+    drop(st);
+    // Only the old generation's clean-up runs: a roster refresh, no question.
+    loop {
+        match rx.try_recv() {
+            Ok(RunnerEvent::RosterChanged { .. }) => {}
+            Ok(other) => panic!("a stale frame reached a handler: {other:?}"),
+            Err(_) => break,
+        }
+    }
+}
+
+#[tokio::test]
 async fn wrong_token_is_refused() {
     let fake = fake().await;
     let runner = CodexRunner::fixed(fake.url.clone(), "wrong".into(), Duration::from_secs(1));
@@ -625,6 +854,8 @@ async fn a_turn_that_ends_before_its_start_reply_stays_ended() {
     let mut rx = runner.events();
     let server = async {
         fake.handshake().await;
+        fake.read_before_resume(spike(10)["result"]["thread"].clone())
+            .await;
         let resume = fake.expect("thread/resume").await;
         fake.reply(
             &resume,
@@ -676,6 +907,8 @@ async fn resuming_a_running_thread_finds_its_turn_and_a_finished_turn_falls_back
     let runner = fake.runner();
     let server = async {
         fake.handshake().await;
+        fake.read_before_resume(spike(10)["result"]["thread"].clone())
+            .await;
         let resume = fake.expect("thread/resume").await;
         let mut thread = spike(10)["result"]["thread"].clone();
         thread["status"] = json!({"type": "active", "activeFlags": []});
@@ -696,9 +929,42 @@ async fn resuming_a_running_thread_finds_its_turn_and_a_finished_turn_falls_back
         fake.send(err);
         let turn = fake.expect("turn/start").await;
         assert_eq!(turn["params"]["input"][0]["text"], "carry on");
+        // Another app's thread (originator "keo-spike"): its own approvals stay.
+        assert!(turn["params"].get("approvalPolicy").is_none());
+        assert!(turn["params"].get("sandboxPolicy").is_none());
         fake.replay(&turn, 38);
     };
     let (res, ()) = tokio::join!(runner.send(THREAD, "carry on"), server);
+    res.unwrap();
+}
+
+#[tokio::test]
+async fn a_companion_thread_resumed_after_a_restart_keeps_the_one_allow_policy() {
+    // Kills: the policy kept only in memory (lost on restart), or read from the wrong field.
+    let mut fake = fake().await;
+    let runner = fake.runner();
+    let server = async {
+        fake.handshake().await;
+        let mut thread = spike(10)["result"]["thread"].clone();
+        thread["originator"] = json!("keo-companion");
+        fake.read_before_resume(thread.clone()).await;
+        // It loads held to the session policy again, read from its own folder.
+        fake.config_read("/work/repo").await;
+        let resume = fake.expect("thread/resume").await;
+        assert_eq!(
+            resume["params"],
+            json!({"threadId": THREAD, "excludeTurns": true, "config": base_config()})
+        );
+        fake.reply(&resume, json!({"thread": thread}));
+        let turn = fake.expect("turn/start").await;
+        assert_eq!(turn["params"]["approvalPolicy"], "never");
+        assert_eq!(
+            turn["params"]["sandboxPolicy"],
+            json!({"type": "workspaceWrite", "networkAccess": true})
+        );
+        fake.replay(&turn, 38);
+    };
+    let (res, ()) = tokio::join!(runner.send(THREAD, "next step"), server);
     res.unwrap();
 }
 
@@ -714,6 +980,7 @@ async fn an_unsent_session_stays_off_the_roster_and_close_archives_it_quietly() 
     };
     let server = async {
         fake.handshake().await;
+        fake.config_read("/work/repo").await;
         let start = fake.expect("thread/start").await;
         fake.replay(&start, 10);
         let name = fake.expect("thread/name/set").await;
@@ -733,7 +1000,8 @@ async fn an_unsent_session_stays_off_the_roster_and_close_archives_it_quietly() 
     let (res, ()) = tokio::join!(runner.list(), server);
     assert_eq!(res.unwrap(), Vec::new());
 
-    // A first send that fails is an error, so the inbox closes the session.
+    // A first send that fails is an error, so the inbox closes the session: it is still
+    // unsent, so close archives it and it never reaches the roster.
     let server = async {
         let turn = fake.expect("turn/start").await;
         fake.send(json!({"id": turn["id"], "error": {"code": -32600, "message": "failed to load configuration"}}));
@@ -743,9 +1011,25 @@ async fn an_unsent_session_stays_off_the_roster_and_close_archives_it_quietly() 
         .unwrap_err()
         .to_string()
         .contains("failed to load configuration"));
+    let server = async {
+        let archive = fake.expect("thread/archive").await;
+        assert_eq!(archive["params"], json!({"threadId": THREAD}));
+        fake.reply(&archive, json!({}));
+        let req = fake.expect("thread/list").await;
+        fake.reply(&req, json!({"data": []}));
+    };
+    let (closed, ()) = tokio::join!(
+        async {
+            runner.close(THREAD).await.unwrap();
+            runner.list().await
+        },
+        server
+    );
+    assert_eq!(closed.unwrap(), Vec::new());
 
     // A second start's session never sent: close archives it, with no SessionEnded.
     let server = async {
+        fake.config_read("/work/repo").await;
         let start = fake.expect("thread/start").await;
         let mut r = spike(10);
         r["id"] = start["id"].clone();
@@ -781,7 +1065,40 @@ async fn an_unsent_session_stays_off_the_roster_and_close_archives_it_quietly() 
     }
     assert!(saw_archive, "the archive notification was handled");
     // Closing a session that already got its words does nothing.
-    runner.close(THREAD).await.unwrap();
+    let server = async {
+        fake.config_read("/work/repo").await;
+        let start = fake.expect("thread/start").await;
+        let mut r = spike(10);
+        r["id"] = start["id"].clone();
+        r["result"]["thread"]["id"] = json!("thread-3");
+        fake.send(r);
+        let name = fake.expect("thread/name/set").await;
+        fake.reply(&name, json!({}));
+        let turn = fake.expect("turn/start").await;
+        fake.replay(&turn, 38);
+    };
+    let (sent, ()) = tokio::join!(
+        async {
+            let id = runner
+                .start(StartRequest {
+                    cwd: PathBuf::from("/work/repo"),
+                    name: Some("k".into()),
+                    slack_thread: None,
+                })
+                .await
+                .unwrap();
+            runner.send(&id, "do it").await
+        },
+        server
+    );
+    sent.unwrap();
+    runner.close("thread-3").await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), fake.from_client.recv())
+            .await
+            .is_err(),
+        "close sent nothing for a session that got its words"
+    );
 }
 
 #[tokio::test]
@@ -796,6 +1113,7 @@ async fn a_roster_read_waits_for_a_thread_start_in_flight() {
     };
     let server = async {
         fake.handshake().await;
+        fake.config_read("/work/repo").await;
         let start = fake.expect("thread/start").await;
         began.send(()).unwrap();
         // Codex already lists the new thread, but the roster read waits for the start reply.

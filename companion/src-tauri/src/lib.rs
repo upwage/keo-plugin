@@ -66,6 +66,11 @@ pub struct Core {
     /// sign-in just saved (client id, machine id, keychain), and a sign-in never persists while
     /// a sign-out is still clearing. Registration retries run after it is released.
     lifecycle: tokio::sync::Mutex<()>,
+    /// Held by each settings command for its whole change, and by sign-out across disabling
+    /// start at login and wiping state.json: a settings edit then lands wholly before the wipe
+    /// (and is wiped) or wholly after it (a signed-out edit), never in between. A plain lock,
+    /// not `lifecycle`, so a toggle never waits on a browser sign-in.
+    settings: Mutex<()>,
     /// Counts folder edits, so only the newest one keeps retrying its update to Keo.
     folder_edits: std::sync::atomic::AtomicU64,
     last_error: Mutex<Option<String>>,
@@ -150,7 +155,12 @@ impl Core {
                 .iter()
                 .map(tool_view)
                 .collect(),
-            sessions: p.last_roster,
+            // The runners' latest read while signed in (Keo's baseline can lag a failed send);
+            // the saved one before the first read, and after a sign-out wiped it.
+            sessions: match self.registry.shown.get() {
+                Some(list) if snap.signed_in() => list,
+                _ => p.last_roster,
+            },
             host: self.base.origin().to_string(),
             version: self.app.package_info().version.to_string(),
             error: self.last_error.lock().expect("error lock").clone(),
@@ -276,8 +286,17 @@ impl Core {
                 // A new sign-in may be another account (after a revoked grant, say): its task
                 // and prompt ids start a fresh ledger, and anything from before is fenced off.
                 self.inbox.forget();
-                let first = !self.store.get().first_run_done;
-                if first {
+                // Under the settings lock: a Start at login toggle lands before (and is kept)
+                // or after this, never halfway.
+                let settings = self.settings.lock().expect("settings lock");
+                let kept = self.store.get();
+                let first = !kept.first_run_done;
+                if first && kept.start_at_login_chosen {
+                    // Set by hand before this first sign-in: that choice stands as it is.
+                    if let Err(e) = self.store.update(|p| p.first_run_done = true) {
+                        tracing::warn!(error = %e, "first run not saved");
+                    }
+                } else if first {
                     // First run completes at the first sign-in: start at login is on by default.
                     // The saved value is what the system actually did; a save that fails undoes
                     // the login item and leaves first run to try again at the next sign-in.
@@ -306,6 +325,7 @@ impl Core {
                         }
                     }
                 }
+                drop(settings);
                 self.machine.apply(Event::SignedIn);
                 drop(lifecycle);
                 self.register().await;
@@ -331,11 +351,15 @@ impl Core {
         let _lifecycle = self.lifecycle.lock().await;
         let removed = self.auth.sign_out().await;
         self.keo.reset().await;
+        let settings = self.settings.lock().expect("settings lock");
         // The saved choices are gone with state.json, so start at login goes too.
         let unlaunched = self.app.autolaunch().disable();
         if let Err(e) = &unlaunched {
             tracing::warn!(error = %e, "start at login not disabled");
         }
+        // Ends any sign-in begun during the awaits above, so a write checked against it under the
+        // store lock never lands after the wipe.
+        self.auth.end_generation();
         // Wipes state.json and resets the live pause flag and state to match it.
         let forgot = state::forget_all(&self.store, &self.machine);
         if let Err(e) = &forgot {
@@ -344,13 +368,14 @@ impl Core {
         // Anything begun during this sign-out's awaits is fenced off; from here on the app reads
         // as signed out, so nothing new starts.
         self.auth.end_generation();
+        drop(settings);
+        // After the fence: a sync of the old sign-in that is still reading cannot refill it.
+        self.registry.shown.clear();
         tracing::info!("signed out");
         // Anything sign-out could not undo is shown, never reported as a clean sign-out.
+        // A clean sign-out also clears an error left from before (a failed registration, say).
         let text = sign_out_error_text(removed.is_err(), forgot.is_err(), unlaunched.is_err());
-        if let Some(text) = text {
-            self.set_error(Some(text));
-        }
-        self.emit_status();
+        self.set_error(text);
     }
 }
 
@@ -375,17 +400,20 @@ async fn sign_out(core: CoreState<'_>) -> Result<(), String> {
 
 #[tauri::command]
 fn set_paused(core: CoreState<'_>, paused: bool) -> Result<StatusView, String> {
+    let settings = core.settings.lock().expect("settings lock");
     core.store
         .update(|p| p.paused = paused)
         .map_err(|e| e.to_string())?;
     // Saved first; the live flag changes only once the choice is on disk.
     core.machine.set_paused(paused);
+    drop(settings);
     core.emit_status();
     Ok(core.status())
 }
 
 #[tauri::command]
 fn set_start_at_login(core: CoreState<'_>, enabled: bool) -> Result<StatusView, String> {
+    let settings = core.settings.lock().expect("settings lock");
     let launcher = core.app.autolaunch();
     // What the system did before this call, so a failed save puts back exactly that.
     let before = launcher.is_enabled().ok();
@@ -397,7 +425,11 @@ fn set_start_at_login(core: CoreState<'_>, enabled: bool) -> Result<StatusView, 
     r.map_err(|e| e.to_string())?;
     // The login item and state.json change together: a save that fails puts the login item
     // back, so the panel never shows the opposite of what the system does.
-    if let Err(e) = core.store.update(|p| p.start_at_login = enabled) {
+    let saved = core.store.update(|p| {
+        p.start_at_login = enabled;
+        p.start_at_login_chosen = true;
+    });
+    if let Err(e) = saved {
         let undo = match before {
             Some(true) => launcher.enable(),
             Some(false) => launcher.disable(),
@@ -408,6 +440,7 @@ fn set_start_at_login(core: CoreState<'_>, enabled: bool) -> Result<StatusView, 
         }
         return Err(e.to_string());
     }
+    drop(settings);
     core.emit_status();
     Ok(core.status())
 }
@@ -415,18 +448,22 @@ fn set_start_at_login(core: CoreState<'_>, enabled: bool) -> Result<StatusView, 
 #[tauri::command]
 fn add_dir(core: CoreState<'_>, path: String) -> Result<StatusView, String> {
     let dir = dirs::normalize(&path).map_err(|e| e.to_string())?;
+    let settings = core.settings.lock().expect("settings lock");
     core.store
         .update(|p| dirs::add(&mut p.approved_dirs, dir))
         .map_err(|e| e.to_string())?;
+    drop(settings);
     reregister(&core);
     Ok(core.status())
 }
 
 #[tauri::command]
 fn remove_dir(core: CoreState<'_>, path: String) -> Result<StatusView, String> {
+    let settings = core.settings.lock().expect("settings lock");
     core.store
         .update(|p| dirs::remove(&mut p.approved_dirs, std::path::Path::new(&path)))
         .map_err(|e| e.to_string())?;
+    drop(settings);
     reregister(&core);
     Ok(core.status())
 }
@@ -907,6 +944,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         signing_in: AtomicBool::new(false),
         sign_in_attempts: std::sync::atomic::AtomicU64::new(0),
         lifecycle: tokio::sync::Mutex::new(()),
+        settings: Mutex::new(()),
         folder_edits: std::sync::atomic::AtomicU64::new(0),
         last_error: Mutex::new(None),
         tray_rect: Mutex::new(None),
@@ -952,6 +990,18 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 if rx.changed().await.is_err() {
                     break;
                 }
+            }
+        });
+    }
+
+    // Roster watcher: the panel's session list on every change the runners report (a state
+    // change in a session moves no machine state, so the watcher above would miss it).
+    {
+        let core = core.clone();
+        let mut rx = core.registry.shown.subscribe();
+        tauri::async_runtime::spawn(async move {
+            while rx.changed().await.is_ok() {
+                core.emit_status();
             }
         });
     }

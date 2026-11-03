@@ -303,6 +303,7 @@ impl Inbox {
             .await;
         if !self.is_current(generation) {
             tracing::info!("inbox: pull dropped (signed out meanwhile)");
+            self.machine.apply(Event::NothingToDo);
             return;
         }
         let reply = match pulled {
@@ -318,7 +319,10 @@ impl Inbox {
                 self.machine.apply(Event::Unauthorized);
                 return;
             }
-            Err(KeoError::Superseded) => return,
+            Err(KeoError::Superseded) => {
+                self.machine.apply(Event::NothingToDo);
+                return;
+            }
             Err(KeoError::RateLimited) => {
                 tracing::info!("inbox pull rate limited; backing off");
                 self.machine.apply(Event::NothingToDo);
@@ -599,6 +603,18 @@ impl Inbox {
             .lock()
             .expect("ledger lock")
             .pending(generation, id, outcome, detail.clone());
+        // Every ack goes through here. A task's outcome is on disk before its ack is sent: a quit
+        // mid-ack then replays it, not the "delivery interrupted" failure written when the task
+        // was claimed. Unsaved, the ack is not sent; it stays pending in memory and is replayed
+        // (and saved again) the next time the task is pulled.
+        let saved = match id {
+            AckTarget::Task(_) => self.save(generation),
+            AckTarget::Prompt(_) => Ok(()),
+        };
+        if let Err(e) = saved {
+            tracing::warn!(item = %label(id), error = %e, "inbox: outcome not recorded; ack held");
+            return;
+        }
         let reply = self
             .keo
             .call_tool(

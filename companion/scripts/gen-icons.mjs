@@ -1,11 +1,10 @@
-// Draws the Keo Companion icons as plain PNG bytes, with no image library:
-//   src-tauri/icons/tray/<state>.png   one 44x44 macOS template icon per tray state (black + alpha)
-//   src-tauri/icons/source.png         a 1024x1024 app icon
-// Run it again after a change to a shape; the output is committed. To refresh the bundle icons,
+// Draws the 1024x1024 Keo Companion app icon (src-tauri/icons/source.png) as plain PNG bytes, with
+// no image library. The tray icons are not drawn here: src-tauri/icons/tray/build.py writes them.
+// Run it again after a change to the shape; the output is committed. To refresh the bundle icons,
 // run `npx tauri icon src-tauri/icons/source.png -o <temp folder>` and copy 32x32.png,
 // 128x128.png, icon.png, icon.icns and icon.ico from it into src-tauri/icons/.
 import { Buffer } from 'node:buffer';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { deflateSync } from 'node:zlib';
@@ -65,9 +64,6 @@ function encode(size, shade, color) {
 
 // Shapes in unit coordinates (0..1), each returns 1 inside and 0 outside.
 const dist = (x, y, cx, cy) => Math.hypot(x - cx, y - cy);
-const disc = (cx, cy, r) => (x, y) => (dist(x, y, cx, cy) <= r ? 1 : 0);
-const ring = (cx, cy, r, w) => (x, y) => (Math.abs(dist(x, y, cx, cy) - r) <= w / 2 ? 1 : 0);
-const box = (x0, y0, x1, y1) => (x, y) => (x >= x0 && x <= x1 && y >= y0 && y <= y1 ? 1 : 0);
 const line = (x0, y0, x1, y1, w) => (x, y) => {
   const dx = x1 - x0;
   const dy = y1 - y0;
@@ -75,24 +71,9 @@ const line = (x0, y0, x1, y1, w) => (x, y) => {
   return dist(x, y, x0 + t * dx, y0 + t * dy) <= w / 2 ? 1 : 0;
 };
 const union = (...fs) => (x, y) => Math.max(...fs.map((f) => f(x, y)));
-const minus = (a, b) => (x, y) => Math.min(a(x, y), 1 - b(x, y));
 
-// A "K" inside a ring is the base mark; each state changes the ring.
+// The "K" on the app icon.
 const k = union(line(0.38, 0.3, 0.38, 0.7, 0.09), line(0.4, 0.5, 0.62, 0.3, 0.09), line(0.45, 0.46, 0.63, 0.7, 0.09));
-const fullRing = ring(0.5, 0.5, 0.4, 0.08);
-const TRAY = {
-  'signed-out': union(minus(fullRing, box(0.42, 0, 0.58, 0.2)), line(0.2, 0.8, 0.8, 0.2, 0.07)),
-  listening: union(fullRing, k),
-  paused: union(fullRing, box(0.36, 0.3, 0.45, 0.7), box(0.55, 0.3, 0.64, 0.7)),
-  working: minus(disc(0.5, 0.5, 0.44), k),
-  'needs-attention': union(fullRing, box(0.45, 0.24, 0.55, 0.6), disc(0.5, 0.72, 0.06)),
-  'needs-update': union(fullRing, line(0.5, 0.28, 0.5, 0.72, 0.09), line(0.5, 0.72, 0.33, 0.55, 0.09), line(0.5, 0.72, 0.67, 0.55, 0.09)),
-};
-
-mkdirSync(join(iconsDir, 'tray'), { recursive: true });
-for (const [name, shape] of Object.entries(TRAY)) {
-  writeFileSync(join(iconsDir, 'tray', `${name}.png`), encode(44, shape, () => [0, 0, 0]));
-}
 
 // The app icon: a green rounded square with a white K.
 const rounded = (x, y) => {

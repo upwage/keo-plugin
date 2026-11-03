@@ -185,15 +185,10 @@ fn session_folder(
         .ok_or_else(|| RunnerError::NoSession(session.to_string()))
 }
 
-/// Whether `cwd` is inside a folder approved now.
-fn approved_folder(approved: &[PathBuf], cwd: &str) -> Result<(), RunnerError> {
-    if crate::dirs::contains(approved, Path::new(cwd)) {
-        Ok(())
-    } else {
-        Err(RunnerError::Failed(
-            "folder not approved on this machine".into(),
-        ))
-    }
+/// `cwd`, canonical, when it is inside a folder approved now.
+fn approved_folder(approved: &[PathBuf], cwd: &str) -> Result<PathBuf, RunnerError> {
+    crate::dirs::admit(approved, Path::new(cwd))
+        .ok_or_else(|| RunnerError::Failed("folder not approved on this machine".into()))
 }
 
 /// What a bind replaced, for `unbind`.
@@ -358,16 +353,22 @@ impl Sessions {
     }
 }
 
+/// The answer names a session other than the one whose question it answers.
+fn session_mismatch(a: &PromptAnswer, recorded: &str) -> bool {
+    a.session_id.as_deref().is_some_and(|s| s != recorded)
+}
+
 /// The runner's form of a person's answer: a chosen option wins over free text.
 pub fn to_answer(a: &PromptAnswer) -> Answer {
     if a.cancelled {
         return Answer::Cancelled;
     }
     // Keo sends a chosen option as its index plus its text in `answer`; the runner takes the
-    // option's text.
+    // option's text. An index with no text names no option for sure (an option may itself read
+    // "0"), so it answers nothing.
     match (a.option, &a.answer) {
-        (Some(_), Some(t)) => Answer::Option(t.clone()),
-        (Some(i), None) => Answer::Option(i.to_string()),
+        (Some(_), Some(t)) if !t.is_empty() => Answer::Option(t.clone()),
+        (Some(_), _) => Answer::Cancelled,
         (None, Some(t)) => Answer::Text(t.clone()),
         (None, None) => Answer::Cancelled,
     }
@@ -437,7 +438,7 @@ impl Relay {
         sign_in: u64,
         current: &(dyn Fn() -> bool + Sync),
         cwd: &str,
-    ) -> Result<(), RunnerError> {
+    ) -> Result<PathBuf, RunnerError> {
         self.still_current(sign_in, current)?;
         approved_folder(&self.store.get().approved_dirs, cwd)
     }
@@ -458,10 +459,11 @@ impl Relay {
             .runner_for(tool)
             .ok_or(RunnerError::NotInstalled(tool.display_name()))?;
         if task.new {
-            self.admitted(sign_in, current, &task.cwd)?;
+            // The session opens in the canonical folder the check admitted, not the path as sent.
+            let cwd = self.admitted(sign_in, current, &task.cwd)?;
             let id = runner
                 .start(StartRequest {
-                    cwd: PathBuf::from(&task.cwd),
+                    cwd,
                     name: None,
                     slack_thread: task
                         .slack_thread
@@ -482,7 +484,7 @@ impl Relay {
             // undoes the bind, so a later local turn is not relayed as Keo's.
             let prior = self.bind(session, sign_in, Backlog::Drop).await?;
             let sent = match self.admitted(sign_in, current, &cwd) {
-                Ok(()) => runner.send(session, &task.text).await,
+                Ok(_) => runner.send(session, &task.text).await,
                 Err(e) => Err(e),
             };
             if let Err(e) = sent {
@@ -511,7 +513,7 @@ impl Relay {
         self.admitted(sign_in, current, &task.cwd)?;
         let prior = self.bind(session, sign_in, Backlog::Replay).await?;
         let sent = match self.admitted(sign_in, current, &task.cwd) {
-            Ok(()) => runner.send(session, &task.text).await,
+            Ok(_) => runner.send(session, &task.text).await,
             Err(e) => Err(e),
         };
         if let Err(e) = sent {
@@ -558,9 +560,11 @@ impl Relay {
             .unbind(id, generation, prior);
     }
 
-    /// Hand an answer to the runner that asked the question; when the asker is not known
-    /// (for example after a restart), try each runner until one owns the prompt. Returns the
-    /// machine-wide state change: InputGiven only once no question is left open.
+    /// Hand an answer to the runner that asked the question. Only a question this companion
+    /// relayed is answered, in the session that asked it: the folder check below and the runner
+    /// (which finds the prompt by its id) then act on the same session, whatever session id the
+    /// answer names. Returns the machine-wide state change: InputGiven only once no question is
+    /// left open.
     pub async fn deliver_answer(
         &self,
         a: &PromptAnswer,
@@ -574,33 +578,17 @@ impl Relay {
             .expect("prompts lock")
             .get(&a.prompt_id)
             .cloned();
-        let session = a
-            .session_id
-            .clone()
-            .or_else(|| known.as_ref().map(|(_, s)| s.clone()));
-        let candidates: Vec<Arc<dyn Runner>> = match known.and_then(|(t, _)| self.runner_for(t)) {
-            Some(r) => vec![r],
-            None => self.runners.clone(),
-        };
-        // An answer resumes work in its session's folder: find the session's tool and real
-        // folder, and check that folder is approved, before anything makes the session
-        // relayable.
-        let s = session
-            .as_deref()
-            .ok_or_else(|| RunnerError::NoSession(a.prompt_id.clone()))?;
-        let mut found = None;
-        let mut last = RunnerError::NoSession(a.prompt_id.clone());
-        for r in candidates {
-            match r.list().await.and_then(|roster| session_folder(&roster, s)) {
-                Ok(cwd) => {
-                    found = Some((r, cwd));
-                    break;
-                }
-                Err(e @ (RunnerError::Unsupported(_) | RunnerError::NoSession(_))) => last = e,
-                Err(e) => return Err(e),
-            }
+        let no_session = || RunnerError::NoSession(a.prompt_id.clone());
+        let (tool, recorded) = known.ok_or_else(no_session)?;
+        if session_mismatch(a, &recorded) {
+            tracing::warn!("answer names another session than its question; refused");
+            return Err(no_session());
         }
-        let (runner, cwd) = found.ok_or(last)?;
+        let runner = self.runner_for(tool).ok_or_else(no_session)?;
+        // An answer resumes work in its session's folder: find the session's real folder, and
+        // check that folder is approved, before anything makes the session relayable.
+        let s = recorded.as_str();
+        let cwd = session_folder(&runner.list().await?, s)?;
         self.admitted(sign_in, current, &cwd)?;
         // After a restart nothing is bound: Keo asked this session's question, so bind it
         // before the answer goes in, or what the session says next would be held for good.
@@ -616,7 +604,7 @@ impl Relay {
         };
         // Checked again right before the answer: the bind's replay awaits.
         let outcome = match self.admitted(sign_in, current, &cwd) {
-            Ok(()) => runner.answer(&a.prompt_id, answer).await,
+            Ok(_) => runner.answer(&a.prompt_id, answer).await,
             Err(e) => Err(e),
         };
         match outcome {
@@ -625,15 +613,14 @@ impl Relay {
                     .lock()
                     .expect("prompts lock")
                     .remove(&a.prompt_id);
-                Ok(session.and_then(|s| {
-                    self.sessions
-                        .lock()
-                        .expect("sessions lock")
-                        .answered(&s, sign_in)
-                }))
+                Ok(self
+                    .sessions
+                    .lock()
+                    .expect("sessions lock")
+                    .answered(s, sign_in))
             }
             Err(e) => {
-                if let (Some(s), Some(prior)) = (&session, reserved) {
+                if let Some(prior) = reserved {
                     self.unbind(s, sign_in, prior);
                     if self.idle() {
                         self.machine.apply(Event::TaskDone);
@@ -693,12 +680,15 @@ impl Relay {
     }
 
     /// Handle one session's events in order. After its SessionEnded the lane closes: what is
-    /// already queued is still handled, and a later event opens a new lane.
+    /// already queued is still handled, and a later event opens a new lane. After a TurnEnded
+    /// with nothing more queued the session is idle, and its lane closes too.
     async fn run_lane(self: Arc<Self>, id: String, mut rx: mpsc::UnboundedReceiver<RunnerEvent>) {
         let gate = self.gate(&id);
+        let mut closed = false;
         while let Some(ev) = rx.recv().await {
             let ended = matches!(ev, RunnerEvent::SessionEnded { .. });
-            if ended {
+            let idle = matches!(ev, RunnerEvent::TurnEnded { .. });
+            if ended && !closed {
                 self.lanes.lock().expect("lanes lock").remove(&id);
             }
             {
@@ -706,11 +696,29 @@ impl Relay {
                 self.handle(ev).await;
             }
             if ended {
+                closed = true;
                 rx.close();
+            } else if idle && !closed {
+                // `dispatch` queues under the lanes lock: checked under it, nothing can slip in
+                // between, and the next event opens a new lane after this one is done.
+                let mut lanes = self.lanes.lock().expect("lanes lock");
+                if rx.is_empty() {
+                    lanes.remove(&id);
+                    closed = true;
+                    rx.close();
+                }
             }
         }
+        // The gate goes only while nothing else holds it (a bind replaying a backlog does): a
+        // later lane then makes a new one, and nothing still waits on this one.
         if !self.lanes.lock().expect("lanes lock").contains_key(&id) {
-            self.gates.lock().expect("gates lock").remove(&id);
+            let mut gates = self.gates.lock().expect("gates lock");
+            if gates
+                .get(&id)
+                .is_some_and(|g| Arc::ptr_eq(g, &gate) && Arc::strong_count(g) == 2)
+            {
+                gates.remove(&id);
+            }
         }
     }
 
@@ -944,6 +952,7 @@ mod tests {
             name: "n".into(),
             state: SessionState::Idle,
             pid: None,
+            active_at: None,
         };
         let tmp = tempfile::tempdir().unwrap();
         let work = tmp.path().canonicalize().unwrap().join("work");
@@ -1037,6 +1046,20 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_naming_another_session_is_refused() {
+        let a = |session: Option<&str>| PromptAnswer {
+            prompt_id: "p1".into(),
+            session_id: session.map(str::to_string),
+            answer: None,
+            option: None,
+            cancelled: false,
+        };
+        assert!(!session_mismatch(&a(None), "s1"));
+        assert!(!session_mismatch(&a(Some("s1")), "s1"));
+        assert!(session_mismatch(&a(Some("s2")), "s1"));
+    }
+
+    #[test]
     fn answers_map_to_runner_form() {
         let a = |answer: Option<&str>, option: Option<u32>, cancelled: bool| PromptAnswer {
             prompt_id: "p1".into(),
@@ -1055,5 +1078,8 @@ mod tests {
         );
         assert_eq!(to_answer(&a(Some("go"), Some(1), true)), Answer::Cancelled);
         assert_eq!(to_answer(&a(None, None, false)), Answer::Cancelled);
+        // An index alone, or with empty text, is never turned into an option's text.
+        assert_eq!(to_answer(&a(None, Some(0), false)), Answer::Cancelled);
+        assert_eq!(to_answer(&a(Some(""), Some(1), false)), Answer::Cancelled);
     }
 }

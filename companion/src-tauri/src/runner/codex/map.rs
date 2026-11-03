@@ -5,7 +5,7 @@
 
 use serde_json::{json, Map, Value};
 
-use super::super::{Answer, RosterEntry, SessionState, ToolKind};
+use super::super::{prefix_units, units, Answer, RosterEntry, SessionState, ToolKind};
 
 /// Keo's caps (`CC_COMPANION_MAX` in cc-bridge/contract.ts).
 pub const MAX_TEXT: usize = 2_000;
@@ -13,12 +13,12 @@ pub const MAX_OPTIONS: usize = 10;
 pub const MAX_OPTION: usize = 75;
 pub const MAX_NAME: usize = 200;
 
-/// Cut `s` to `max` characters, marking the cut.
+/// Cut `s` to `max` UTF-16 units (how Keo measures a question), marking the cut.
 pub fn cut(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+    if units(s) <= max {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    let mut out = prefix_units(s, max.saturating_sub(1)).to_string();
     out.push('…');
     out
 }
@@ -48,12 +48,12 @@ pub fn state_of(status: &Value) -> SessionState {
     }
 }
 
-/// The name Keo shows: the thread's own name, else its first prompt, else its short id.
+/// The name Keo shows: the thread's own name, else its short id. Never its first prompt
+/// (`preview`): the roster lists threads Keo never handed work to, and their prompts stay here.
 pub fn thread_name(thread: &Value) -> String {
     let id = str_of(thread, "id").unwrap_or("");
     let name = str_of(thread, "name")
         .map(str::to_string)
-        .or_else(|| str_of(thread, "preview").map(|p| cut(p.lines().next().unwrap_or(p), 80)))
         .unwrap_or_else(|| format!("Codex {}", id.chars().take(8).collect::<String>()));
     cut(&name, MAX_NAME)
 }
@@ -83,6 +83,7 @@ pub fn roster_entry(thread: &Value) -> Option<RosterEntry> {
             .map(state_of)
             .unwrap_or(SessionState::Idle),
         pid: None,
+        active_at: Some(thread_touched(thread)).filter(|t| *t > 0),
     })
 }
 
@@ -209,6 +210,129 @@ fn command_text(v: &Value) -> String {
         .unwrap_or_default()
 }
 
+/// What a `fileChange` item would do, one block per file: the path, the kind of change, and the
+/// whole diff. `None` when a part cannot be shown as it is (a field this does not render, or
+/// text that would break its quoting): then the approval can only be denied from Slack.
+pub fn change_details(item: &Value) -> Option<Vec<String>> {
+    let changes = item.get("changes")?.as_array()?;
+    if changes.is_empty() {
+        return None;
+    }
+    changes
+        .iter()
+        .map(|ch| {
+            let ch = ch.as_object()?;
+            if ch
+                .keys()
+                .any(|k| !["path", "kind", "diff"].contains(&k.as_str()))
+            {
+                return None;
+            }
+            let path = ch.get("path")?.as_str().filter(|p| quotable(p))?;
+            let kind = ch.get("kind")?.as_object()?;
+            if kind
+                .keys()
+                .any(|k| !["type", "move_path"].contains(&k.as_str()))
+            {
+                return None;
+            }
+            let kind_type = kind.get("type")?.as_str()?;
+            if !["add", "delete", "update"].contains(&kind_type) {
+                return None;
+            }
+            let mut head = format!("`{path}` ({kind_type})");
+            match kind.get("move_path") {
+                None | Some(Value::Null) => {}
+                // Only an update moves a file.
+                Some(m) if kind_type == "update" => {
+                    head.push_str(&format!(" to `{}`", m.as_str().filter(|m| quotable(m))?))
+                }
+                Some(_) => return None,
+            }
+            let diff = ch.get("diff")?.as_str()?;
+            if diff.contains("```") {
+                return None;
+            }
+            Some(format!("{head}\n```\n{diff}\n```"))
+        })
+        .collect()
+}
+
+/// Whether `params` is an object whose every key is one the question knows (`known`): Allow grants
+/// the request as sent, so a field it does not render keeps the approval deny-only.
+fn keys_known(params: &Value, known: &[&str]) -> bool {
+    params
+        .as_object()
+        .is_some_and(|o| o.keys().all(|k| known.contains(&k.as_str())))
+}
+
+/// An optional field: absent, null, or text that shows as it is between backticks.
+fn optional_quotable(params: &Value, key: &str) -> bool {
+    match params.get(key) {
+        None | Some(Value::Null) => true,
+        Some(Value::String(s)) => quotable(s),
+        Some(_) => false,
+    }
+}
+
+/// A required field: text that shows as it is between backticks.
+fn required_quotable(params: &Value, key: &str) -> bool {
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .is_some_and(quotable)
+}
+
+/// The request fields every approval may carry besides its own: ids, timing and a reason.
+const APPROVAL_COMMON: &[&str] = &[
+    "approvalId",
+    "environmentId",
+    "itemId",
+    "reason",
+    "startedAtMs",
+    "threadId",
+    "turnId",
+];
+
+/// Text that shows as it is between single backticks.
+fn quotable(s: &str) -> bool {
+    !s.is_empty() && !s.contains(['`', '\n'])
+}
+
+/// Whether a permissions request holds only what the question renders: file-system read and
+/// write lists of paths, and the network switch. Allow grants the whole request, so anything
+/// else (sandbox entries, glob depth, a field a newer Codex adds) keeps it deny-only.
+fn permissions_shown(requested: &Value) -> bool {
+    let Some(req) = requested.as_object() else {
+        return false;
+    };
+    let only = |o: &Map<String, Value>, keys: &[&str]| o.keys().all(|k| keys.contains(&k.as_str()));
+    let paths = |v: Option<&Value>| match v {
+        None | Some(Value::Null) => true,
+        Some(Value::Array(a)) => a
+            .iter()
+            .all(|p| p.as_str().is_some_and(|p| !p.contains('\n'))),
+        _ => false,
+    };
+    let fs_ok = match req.get("fileSystem") {
+        None | Some(Value::Null) => true,
+        Some(Value::Object(fs)) => {
+            only(fs, &["read", "write"]) && paths(fs.get("read")) && paths(fs.get("write"))
+        }
+        _ => false,
+    };
+    let net_ok = match req.get("network") {
+        None | Some(Value::Null) => true,
+        Some(Value::Object(n)) => {
+            only(n, &["enabled"])
+                && n.get("enabled")
+                    .map_or(true, |e| e.is_boolean() || e.is_null())
+        }
+        _ => false,
+    };
+    only(req, &["fileSystem", "network"]) && fs_ok && net_ok
+}
+
 /// The paths a `fileChange` item touches.
 pub fn change_paths(item: &Value) -> Vec<String> {
     item.get("changes")
@@ -285,19 +409,7 @@ pub enum Ask {
     Elicitation { field: Option<Field> },
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Field {
-    pub name: String,
-    pub kind: FieldKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FieldKind {
-    Text,
-    Number,
-    Integer,
-    Boolean,
-}
+pub use super::super::form::{Field, Kind as FieldKind};
 
 /// One question for Keo.
 #[derive(Debug, Clone, PartialEq)]
@@ -332,7 +444,8 @@ fn decision_label(d: &str) -> Option<&'static str> {
 }
 
 /// Buttons for the string decisions offered (object decisions change Codex's saved policy and
-/// stay at the machine); a dismissal declines, or cancels when decline is not offered.
+/// stay at the machine); a dismissal declines, or cancels when decline is not offered. A list
+/// with no decision this knows gets a lone Deny, never an invented Allow.
 fn decision_choices(available: &[Value]) -> Ask {
     let mut choices: Vec<(String, Value)> = available
         .iter()
@@ -340,15 +453,7 @@ fn decision_choices(available: &[Value]) -> Ask {
         .filter_map(|d| decision_label(d).map(|l| (l.to_string(), json!({ "decision": d }))))
         .collect();
     if choices.is_empty() {
-        choices = ["accept", "decline"]
-            .iter()
-            .map(|d| {
-                (
-                    decision_label(d).unwrap_or(d).to_string(),
-                    json!({ "decision": d }),
-                )
-            })
-            .collect();
+        choices.push(("Deny".into(), json!({"decision": "decline"})));
     }
     let has = |d: &str| choices.iter().any(|(_, r)| r["decision"] == d);
     let deny = if has("decline") || !has("cancel") {
@@ -359,14 +464,51 @@ fn decision_choices(available: &[Value]) -> Ask {
     Ask::Choices { choices, deny }
 }
 
+/// The decisions an approval offers: Codex's own default when it sends no list (the field is
+/// absent from older and newer servers alike), else the list as sent. A list that is empty, not
+/// a list, or holds an entry that is neither a known decision nor an object decision (those stay
+/// at the machine) is malformed: `None`, so the approval is deny-only.
+fn decisions_offered(params: &Value) -> Option<Vec<Value>> {
+    match params.get("availableDecisions") {
+        None => Some(
+            ["accept", "acceptForSession", "decline", "cancel"]
+                .iter()
+                .map(|d| json!(d))
+                .collect(),
+        ),
+        Some(Value::Array(a)) if !a.is_empty() => {
+            let known = |d: &Value| match d {
+                Value::String(s) => decision_label(s).is_some(),
+                Value::Object(_) => true,
+                _ => false,
+            };
+            (a.iter().all(known) && a.iter().any(Value::is_string)).then(|| a.clone())
+        }
+        Some(_) => None,
+    }
+}
+
 /// Said when an approval does not fit one Keo question: Allow must never accept what the person
 /// could not read, so only the deny answers stay.
 const TOO_LONG: &str =
     "\n\nThis request is too long to show here in full, so Slack can only deny it. To allow it, answer at the machine.";
+/// Said when an approval holds a part the question cannot show as it is.
+const NOT_SHOWN: &str =
+    "\n\nPart of this request cannot be shown here as it is, so Slack can only deny it. To allow it, answer at the machine.";
 
-fn finish(text: String, ask: Ask) -> Built {
+/// An approval question. `shown` says the text renders everything Allow would grant; when it
+/// does not, or the text is too long for one Keo question, only the deny answers stay.
+fn finish(text: String, ask: Ask, shown: bool) -> Built {
+    let note = if !shown {
+        Some(NOT_SHOWN)
+    } else if units(&text) > MAX_TEXT {
+        Some(TOO_LONG)
+    } else {
+        None
+    };
     let (text, ask) = match ask {
-        Ask::Choices { choices, deny } if text.chars().count() > MAX_TEXT => {
+        Ask::Choices { choices, deny } if note.is_some() => {
+            let note = note.unwrap_or(TOO_LONG);
             let mut kept: Vec<(String, Value)> = choices
                 .into_iter()
                 .filter(|(_, r)| {
@@ -376,9 +518,9 @@ fn finish(text: String, ask: Ask) -> Built {
             if kept.is_empty() {
                 kept.push(("Deny".into(), deny.clone()));
             }
-            let room = MAX_TEXT - TOO_LONG.chars().count();
+            let room = MAX_TEXT - units(note);
             (
-                format!("{}{TOO_LONG}", cut(&text, room)),
+                format!("{}{note}", cut(&text, room)),
                 Ask::Choices {
                     choices: kept,
                     deny,
@@ -400,8 +542,8 @@ fn finish(text: String, ask: Ask) -> Built {
 
 /// An elicitation question. One that does not fit a Keo question can only be declined from Slack.
 fn elicit(text: String, options: Vec<String>, ask: Ask) -> Built {
-    if text.chars().count() > MAX_TEXT {
-        let room = MAX_TEXT - TOO_LONG.chars().count();
+    if units(&text) > MAX_TEXT {
+        let room = MAX_TEXT - units(TOO_LONG);
         return decline_only(format!("{}{TOO_LONG}", cut(&text, room)));
     }
     Built { text, options, ask }
@@ -433,44 +575,92 @@ pub fn questions(method: &str, params: &Value, files: &[String]) -> Option<Vec<B
     let built = match method {
         "item/commandExecution/requestApproval" => {
             let cwd = str_of(params, "cwd").unwrap_or("its folder");
+            // Every field Allow acts on, by exact shape: the folder, the kind, the command and
+            // any network access. Object decisions (the proposed amendments) never get a button.
+            let known: Vec<&str> = APPROVAL_COMMON
+                .iter()
+                .copied()
+                .chain([
+                    "availableDecisions",
+                    "command",
+                    "commandActions",
+                    "cwd",
+                    "kind",
+                    "networkApprovalContext",
+                    "proposedExecpolicyAmendment",
+                    "proposedNetworkPolicyAmendments",
+                ])
+                .collect();
+            // An absent kind is a command (the protocol's default for older servers); a null,
+            // empty or other kind is not one this shows.
+            let kind_ok = match params.get("kind") {
+                None => true,
+                Some(Value::String(k)) => k == "command" || k == "writeStdin",
+                Some(_) => false,
+            };
+            let mut shown =
+                keys_known(params, &known) && required_quotable(params, "cwd") && kind_ok;
             let mut text = match str_of(params, "kind") {
                 Some("writeStdin") => {
                     format!("Codex wants to type into a running command in `{cwd}`:")
                 }
                 _ => format!("Codex wants to run a command in `{cwd}`:"),
             };
-            let command = str_of(params, "command")
+            // Allow runs the command as sent, so it must show whole: a missing command (the
+            // shortened action list stands in) or one that breaks its fence is deny-only.
+            let whole = str_of(params, "command").filter(|c| !c.contains("```"));
+            let command = whole
                 .map(str::to_string)
                 .unwrap_or_else(|| command_text(params));
             text.push_str(&format!("\n```\n{command}\n```"));
-            if let Some(host) = params
-                .get("networkApprovalContext")
-                .and_then(|n| str_of(n, "host"))
-            {
-                text.push_str(&format!("\nNetwork access to {host}."));
+            shown &= whole.is_some();
+            match params.get("networkApprovalContext") {
+                None | Some(Value::Null) => {}
+                Some(n) => {
+                    // Exactly a host and a known protocol, or the approval is deny-only.
+                    let host = n
+                        .get("host")
+                        .and_then(Value::as_str)
+                        .filter(|h| quotable(h));
+                    let protocol = str_of(n, "protocol")
+                        .filter(|p| ["http", "https", "socks5Tcp", "socks5Udp"].contains(p));
+                    match (host, protocol) {
+                        (Some(h), Some(p)) if keys_known(n, &["host", "protocol"]) => {
+                            text.push_str(&format!("\nNetwork access to `{h}` over {p}."));
+                        }
+                        _ => {
+                            text.push_str("\nIt also asks for network access.");
+                            shown = false;
+                        }
+                    }
+                }
             }
-            let available = params
-                .get("availableDecisions")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_else(|| {
-                    ["accept", "acceptForSession", "decline", "cancel"]
-                        .iter()
-                        .map(|d| json!(d))
-                        .collect()
-                });
+            let offered = decisions_offered(params);
+            shown &= offered.is_some();
+            let available = offered.unwrap_or_default();
             vec![finish(
                 with_reason(text, params),
                 decision_choices(&available),
+                shown,
             )]
         }
         "item/fileChange/requestApproval" => {
+            // `files` holds each change in full (`change_details`); with none the question
+            // cannot show what Allow would write.
             let mut text = "Codex wants to change files".to_string();
             if files.is_empty() {
                 text.push('.');
             } else {
-                text.push_str(&format!(": {}", files.join(", ")));
+                text.push_str(&format!(":\n{}", files.join("\n")));
             }
+            let known: Vec<&str> = APPROVAL_COMMON
+                .iter()
+                .copied()
+                .chain(["grantRoot"])
+                .collect();
+            let shown = !files.is_empty()
+                && keys_known(params, &known)
+                && optional_quotable(params, "grantRoot");
             if let Some(root) = str_of(params, "grantRoot") {
                 text.push_str(&format!("\nIt asks to write anywhere under `{root}`."));
             }
@@ -481,11 +671,13 @@ pub fn questions(method: &str, params: &Value, files: &[String]) -> Option<Vec<B
             vec![finish(
                 with_reason(text, params),
                 decision_choices(&available),
+                shown,
             )]
         }
         "item/permissions/requestApproval" => {
             let cwd = str_of(params, "cwd").unwrap_or("its folder");
-            let requested = params.get("permissions").cloned().unwrap_or(json!({}));
+            // A missing `permissions` is not an empty grant: the request is malformed.
+            let requested = params.get("permissions").cloned().unwrap_or(Value::Null);
             let mut text = format!("Codex asks for more access while working in `{cwd}`.");
             let list = |k: &str| -> Vec<String> {
                 requested
@@ -507,9 +699,17 @@ pub fn questions(method: &str, params: &Value, files: &[String]) -> Option<Vec<B
             if !read.is_empty() {
                 text.push_str(&format!("\nRead: {}", read.join(", ")));
             }
-            if requested.get("network").is_some_and(|n| !n.is_null()) {
+            if requested.pointer("/network/enabled") == Some(&Value::Bool(true)) {
                 text.push_str("\nNetwork access.");
             }
+            let known: Vec<&str> = APPROVAL_COMMON
+                .iter()
+                .copied()
+                .chain(["cwd", "permissions"])
+                .collect();
+            let shown = permissions_shown(&requested)
+                && keys_known(params, &known)
+                && required_quotable(params, "cwd");
             let ask = Ask::Choices {
                 choices: vec![
                     (
@@ -520,7 +720,7 @@ pub fn questions(method: &str, params: &Value, files: &[String]) -> Option<Vec<B
                 ],
                 deny: json!({"permissions": {}}),
             };
-            vec![finish(with_reason(text, params), ask)]
+            vec![finish(with_reason(text, params), ask, shown)]
         }
         "item/tool/requestUserInput" => params
             .get("questions")
@@ -560,74 +760,72 @@ pub fn questions(method: &str, params: &Value, files: &[String]) -> Option<Vec<B
             let server = str_of(params, "serverName").unwrap_or("an MCP server");
             let message = str_of(params, "message").unwrap_or("");
             let mut text = format!("{server} asks: {message}");
-            if str_of(params, "mode") == Some("url") {
-                text.push_str(&format!(
-                    "\nOpen {} to continue, then press Done.",
-                    str_of(params, "url").unwrap_or("the link")
-                ));
+            let mode = match params.get("mode") {
+                // A form is the protocol's default mode.
+                None => Some("form"),
+                Some(Value::String(m)) => Some(m.as_str()),
+                Some(_) => None,
+            };
+            if mode == Some("url") {
+                // Done accepts: it needs the link it stands for.
+                let Some(url) = params
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .filter(|u| quotable(u))
+                else {
+                    text.push_str("\nIt names no link to open.");
+                    return Some(vec![decline_only(text)]);
+                };
+                text.push_str(&format!("\nOpen {url} to continue, then press Done."));
                 return Some(vec![elicit(
                     text,
                     vec!["Done".into(), DECLINE.into()],
                     Ask::Elicitation { field: None },
                 )]);
             }
-            let props = params
-                .get("requestedSchema")
-                .and_then(|s| s.get("properties"))
-                .and_then(Value::as_object);
-            match props.map(|p| p.len()).unwrap_or(0) {
-                0 => vec![elicit(
+            // A form must say what it asks for, in the subset `form::parse` checks: no schema, a
+            // mode this does not know, or any rule nobody here can check can only be declined
+            // (Accept would send an answer to a question nobody saw, or one that breaks a rule).
+            if mode != Some("form") {
+                text.push_str("\nThis request cannot be read here: answer it at the machine, or decline it here.");
+                return Some(vec![decline_only(text)]);
+            }
+            let fields = match params.get("requestedSchema").map(super::super::form::parse) {
+                Some(Ok(fields)) => fields,
+                _ => {
+                    text.push_str("\nThis form asks for an answer Slack cannot give: answer it at the machine, or decline it here.");
+                    return Some(vec![decline_only(text)]);
+                }
+            };
+            let mut fields = fields.into_iter();
+            match (fields.next(), fields.next()) {
+                (None, _) => vec![elicit(
                     text,
                     vec!["Accept".into(), DECLINE.into()],
                     Ask::Elicitation { field: None },
                 )],
-                1 => {
-                    let (name, schema) = props?.iter().next()?;
-                    let kind = match str_of(schema, "type") {
-                        Some("boolean") => FieldKind::Boolean,
-                        Some("number") => FieldKind::Number,
-                        Some("integer") => FieldKind::Integer,
-                        _ => FieldKind::Text,
-                    };
-                    let mut options: Vec<String> = match kind {
+                (Some(field), None) => {
+                    let shown: Vec<String> = match field.kind {
                         FieldKind::Boolean => vec!["Yes".into(), "No".into()],
-                        _ => schema
-                            .get("enum")
-                            .and_then(Value::as_array)
-                            .map(|e| {
-                                e.iter()
-                                    .filter_map(Value::as_str)
-                                    .map(str::to_string)
-                                    .collect()
-                            })
-                            .or_else(|| {
-                                schema.get("oneOf").and_then(Value::as_array).map(|o| {
-                                    o.iter()
-                                        .filter_map(|c| str_of(c, "const"))
-                                        .map(str::to_string)
-                                        .collect()
-                                })
-                            })
-                            .unwrap_or_default(),
+                        _ => field
+                            .values
+                            .iter()
+                            .map(|v| super::super::form::label(v))
+                            .collect(),
                     };
-                    options.truncate(MAX_OPTIONS - 1);
-                    let options: Vec<String> = options
-                        .iter()
-                        .map(|o| cut(o, MAX_OPTION))
+                    let options: Vec<String> = shown
+                        .into_iter()
+                        .take(MAX_OPTIONS - 1)
                         .chain(std::iter::once(DECLINE.to_string()))
                         .collect();
-                    if let Some(title) = str_of(schema, "title").or(Some(name.as_str())) {
-                        text.push_str(&format!("\n({title})"));
-                    }
+                    text.push_str(&format!(
+                        "\n({})",
+                        field.title.as_deref().unwrap_or(&field.name)
+                    ));
                     vec![elicit(
                         text,
                         options,
-                        Ask::Elicitation {
-                            field: Some(Field {
-                                name: name.clone(),
-                                kind,
-                            }),
-                        },
+                        Ask::Elicitation { field: Some(field) },
                     )]
                 }
                 _ => {
@@ -683,20 +881,10 @@ pub fn reply(ask: &Ask, answer: &Answer) -> Reply {
                     json!({"action": "decline"})
                 });
             };
-            let coerced = match field.kind {
-                FieldKind::Boolean => json!(matches!(
-                    value.to_ascii_lowercase().as_str(),
-                    "yes" | "true" | "y"
-                )),
-                FieldKind::Integer => match value.parse::<i64>() {
-                    Ok(n) => json!(n),
-                    Err(_) => return Reply::Done(json!({"action": "decline"})),
-                },
-                FieldKind::Number => match value.parse::<f64>() {
-                    Ok(n) => json!(n),
-                    Err(_) => return Reply::Done(json!({"action": "decline"})),
-                },
-                FieldKind::Text => json!(value),
+            // Only a value the field takes is sent: a listed value (a shortened button label
+            // maps back to the one value it stands for), a whole or finite number, yes or no.
+            let Some(coerced) = super::super::form::coerce(field, value) else {
+                return Reply::Done(json!({"action": "decline"}));
             };
             let mut content = Map::new();
             content.insert(field.name.clone(), coerced);
@@ -781,6 +969,16 @@ mod tests {
         assert!(!q.text.contains(tail));
         assert!(q.text.chars().count() <= MAX_TEXT && q.text.ends_with(TOO_LONG));
         assert_eq!(q.options, vec!["Deny", "Deny and stop"]);
+
+        // Measured in UTF-16 units, as Keo cuts it: emoji count two each.
+        let emoji = format!("echo {} && {tail}", "😀".repeat(MAX_TEXT / 2));
+        assert!(emoji.chars().count() < MAX_TEXT + tail.len());
+        let p =
+            json!({"cwd":"/r","command":emoji,"availableDecisions":["accept","decline","cancel"]});
+        let q = &questions("item/commandExecution/requestApproval", &p, &[]).unwrap()[0];
+        assert!(!q.text.contains(tail));
+        assert!(units(&q.text) <= MAX_TEXT);
+        assert_eq!(q.options, vec!["Deny", "Deny and stop"]);
         assert_eq!(
             reply(&q.ask, &Answer::Option("Allow".into())),
             Reply::Done(json!({"decision":"decline"}))
@@ -791,9 +989,170 @@ mod tests {
         assert_eq!(q.options, vec!["Deny", "Deny and stop"]);
     }
 
+    /// Allow grants the whole request, so a part the question cannot show keeps it deny-only.
+    #[test]
+    fn approvals_with_parts_not_shown_offer_only_deny() {
+        let deny_only = |q: &Built| {
+            assert!(q.text.ends_with(NOT_SHOWN), "{}", q.text);
+            assert!(
+                !q.options.iter().any(|o| o.starts_with("Allow")),
+                "{:?}",
+                q.options
+            );
+            assert!(!matches!(
+                reply(&q.ask, &Answer::Option(q.options[0].clone())),
+                Reply::Done(ref v) if v["decision"] == "accept" || v.get("scope").is_some()
+            ));
+        };
+        // A command known only from its shortened action list, or one that breaks its fence.
+        let p = json!({"cwd":"/r","commandActions":[{"type":"unknown","command":"ls"}]});
+        deny_only(&questions("item/commandExecution/requestApproval", &p, &[]).unwrap()[0]);
+        let p = json!({"cwd":"/r","command":"echo ``` hidden"});
+        deny_only(&questions("item/commandExecution/requestApproval", &p, &[]).unwrap()[0]);
+        // Network access shows its host and protocol; any other shape is deny-only.
+        let p = json!({"cwd":"/r","command":"curl x","networkApprovalContext":{"host":"h","protocol":"https"}});
+        let q = &questions("item/commandExecution/requestApproval", &p, &[]).unwrap()[0];
+        assert!(q.text.contains("`h` over https") && q.options.contains(&"Allow".into()));
+        for bad in [
+            json!({"cwd":"/r","command":"curl x","networkApprovalContext":{"host":"h"}}),
+            json!({"cwd":"/r","command":"curl x","networkApprovalContext":{"host":"h","protocol":"https","port":1}}),
+            json!({"cwd":"/r","command":"curl x","networkApprovalContext":"h"}),
+            // No folder, an unknown kind, an unknown field, decisions that are not a list.
+            json!({"command":"ls"}),
+            json!({"cwd":"/r","command":"ls","kind":"somethingNew"}),
+            json!({"cwd":"/r","command":"ls","additionalPermissions":{}}),
+            json!({"cwd":"/r","command":"ls","availableDecisions":"accept"}),
+        ] {
+            deny_only(&questions("item/commandExecution/requestApproval", &bad, &[]).unwrap()[0]);
+        }
+        // A file change with a grant root of the wrong shape, or an unknown field.
+        let blocks = vec!["`a.rs` (add)\n```\n+x\n```".to_string()];
+        for bad in [
+            json!({"grantRoot": 7}),
+            json!({"grantRoot": "a`b"}),
+            json!({"extra": 1}),
+        ] {
+            deny_only(&questions("item/fileChange/requestApproval", &bad, &blocks).unwrap()[0]);
+        }
+        let ok = json!({"grantRoot": null, "itemId": "i", "reason": "r"});
+        let q = &questions("item/fileChange/requestApproval", &ok, &blocks).unwrap()[0];
+        assert!(q.options.contains(&"Allow".into()));
+        // Permissions with no permissions, or no folder.
+        for bad in [
+            json!({"cwd":"/r"}),
+            json!({"permissions":{"network":{"enabled":true}}}),
+        ] {
+            deny_only(&questions("item/permissions/requestApproval", &bad, &[]).unwrap()[0]);
+        }
+        // A file change whose changes were never seen in full.
+        let q = &questions("item/fileChange/requestApproval", &json!({}), &[]).unwrap()[0];
+        deny_only(q);
+        // Permission fields the text does not render (sandbox entries, glob depth, unknown keys).
+        for perms in [
+            json!({"fileSystem":{"entries":[{"access":"write","path":{"type":"special","value":{"kind":"root"}}}]}}),
+            json!({"fileSystem":{"write":["/x"],"globScanMaxDepth":9}}),
+            json!({"network":{"enabled":true,"hosts":["*"]}}),
+            json!({"somethingNew":true}),
+        ] {
+            let p = json!({"cwd":"/r","permissions":perms});
+            deny_only(&questions("item/permissions/requestApproval", &p, &[]).unwrap()[0]);
+        }
+        let p = json!({"cwd":"/r","permissions":{"network":{"enabled":true}}});
+        let q = &questions("item/permissions/requestApproval", &p, &[]).unwrap()[0];
+        assert!(q.text.contains("Network access.") && q.options[0] == "Allow for this turn");
+    }
+
+    #[test]
+    fn file_changes_show_each_diff_whole_or_not_at_all() {
+        let item = json!({"type":"fileChange","id":"i","changes":[
+            {"path":"a.rs","kind":{"type":"update","move_path":"b.rs"},"diff":"-x\n+y"},
+            {"path":"c.rs","kind":{"type":"add"},"diff":"+z"}]});
+        let blocks = change_details(&item).unwrap();
+        assert_eq!(blocks[0], "`a.rs` (update) to `b.rs`\n```\n-x\n+y\n```");
+        let q = &questions("item/fileChange/requestApproval", &json!({}), &blocks).unwrap()[0];
+        assert!(q.text.contains("+z") && q.options.contains(&"Allow".into()));
+        for bad in [
+            json!({"changes":[{"path":"a","kind":{"type":"update"}}]}),
+            json!({"changes":[{"path":"a","kind":{"type":"update"},"diff":7}]}),
+            json!({"changes":[{"path":"a","kind":{"type":"rename"},"diff":""}]}),
+            json!({"changes":[{"path":"a","kind":{"type":"add","move_path":"b"},"diff":""}]}),
+            json!({"changes":[]}),
+            json!({"changes":[{"path":"a","kind":{"type":"update"},"diff":"```"}]}),
+            json!({"changes":[{"path":"a","kind":{"type":"update"},"diff":"","mode":"0755"}]}),
+            json!({"changes":[{"path":"a`b","kind":{"type":"add"},"diff":""}]}),
+        ] {
+            assert_eq!(change_details(&bad), None, "{bad}");
+        }
+    }
+
+    /// No absent or malformed field falls back to an answer that grants: decision lists that are
+    /// empty or unknown, a null kind, a form with no schema or an unknown mode, a link-less URL
+    /// request, or a field of a type Slack cannot fill all leave only the deny answer.
+    #[test]
+    fn absent_or_malformed_fields_never_fall_back_to_a_grant() {
+        for decisions in [
+            json!([]),
+            json!(["somethingNew"]),
+            json!([7]),
+            json!(null),
+            json!("accept"),
+        ] {
+            let p = json!({"cwd":"/r","command":"ls","availableDecisions":decisions});
+            let q = &questions("item/commandExecution/requestApproval", &p, &[]).unwrap()[0];
+            assert!(
+                !q.options.iter().any(|o| o.starts_with("Allow")),
+                "{decisions}: {:?}",
+                q.options
+            );
+            assert_eq!(
+                reply(&q.ask, &Answer::Option(q.options[0].clone())),
+                Reply::Done(json!({"decision":"decline"}))
+            );
+        }
+        let p = json!({"cwd":"/r","command":"ls","kind":null});
+        let q = &questions("item/commandExecution/requestApproval", &p, &[]).unwrap()[0];
+        assert!(!q.options.contains(&"Allow".into()));
+        // An absent kind is the protocol's default, a command.
+        let p = json!({"cwd":"/r","command":"ls"});
+        let q = &questions("item/commandExecution/requestApproval", &p, &[]).unwrap()[0];
+        assert!(q.options.contains(&"Allow".into()));
+        for bad in [
+            json!({"serverName":"s","message":"m"}),
+            json!({"serverName":"s","message":"m","mode":"form","requestedSchema":{}}),
+            json!({"serverName":"s","message":"m","mode":"other","requestedSchema":{"properties":{}}}),
+            json!({"serverName":"s","message":"m","mode":7,"requestedSchema":{"properties":{}}}),
+            json!({"serverName":"s","message":"m","mode":"url"}),
+            json!({"serverName":"s","message":"m","requestedSchema":{"properties":{"tags":{"type":"array"}}}}),
+            json!({"serverName":"s","message":"m","requestedSchema":{"properties":{"x":{}}}}),
+            json!({"serverName":"s","message":"m","requestedSchema":{"properties":{"x":{"type":"string","enum":[1,2]}}}}),
+            json!({"serverName":"s","message":"m","requestedSchema":{"properties":{"x":{"type":"string","oneOf":[]}}}}),
+            // A root that is no object form, and field rules nobody here checks or that contradict.
+            json!({"serverName":"s","message":"m","requestedSchema":{"type":"string","properties":{}}}),
+            json!({"serverName":"s","message":"m","requestedSchema":{"properties":{}}}),
+            json!({"serverName":"s","message":"m","requestedSchema":{"type":"object","properties":{},"required":["x"]}}),
+            json!({"serverName":"s","message":"m","requestedSchema":{"type":"object","properties":{"x":{"type":"boolean","enum":[true]}}}}),
+            json!({"serverName":"s","message":"m","requestedSchema":{"type":"object","properties":{"x":{"type":"string","minLength":3}}}}),
+            json!({"serverName":"s","message":"m","requestedSchema":{"type":"object","properties":{"x":{"type":"number","maximum":1}}}}),
+        ] {
+            let q = &questions("mcpServer/elicitation/request", &bad, &[]).unwrap()[0];
+            assert_eq!(q.options, vec![DECLINE], "{bad}");
+            for a in ["Accept", "Done", "x", "Yes"] {
+                assert_eq!(
+                    reply(&q.ask, &Answer::Text(a.into())),
+                    Reply::Done(json!({"action":"decline"})),
+                    "{bad}"
+                );
+            }
+        }
+        let p = json!({"serverName":"s","message":"m","mode":"url","url":"https://example.com/x"});
+        let q = &questions("mcpServer/elicitation/request", &p, &[]).unwrap()[0];
+        assert_eq!(q.options, vec!["Done", DECLINE]);
+    }
+
     #[test]
     fn elicitations_that_cannot_be_read_in_full_only_decline() {
-        let long = json!({"serverName":"s","message":"x".repeat(MAX_TEXT)});
+        let long = json!({"serverName":"s","message":"x".repeat(MAX_TEXT),
+            "requestedSchema":{"type":"object","properties":{}}});
         let q = &questions("mcpServer/elicitation/request", &long, &[]).unwrap()[0];
         assert_eq!(q.options, vec![DECLINE]);
         assert!(q.text.ends_with(TOO_LONG));
@@ -854,6 +1213,12 @@ mod tests {
         );
     }
 
+    fn q_enum(values: &[&str]) -> Built {
+        let p = json!({"serverName":"s","threadId":"t","mode":"form","message":"Pick",
+            "requestedSchema":{"type":"object","properties":{"color":{"type":"string","enum":values}}}});
+        questions("mcpServer/elicitation/request", &p, &[]).unwrap()[0].clone()
+    }
+
     #[test]
     fn elicitation_fills_its_one_field() {
         let p = json!({"serverName":"s","threadId":"t","mode":"form","message":"Pick",
@@ -889,6 +1254,47 @@ mod tests {
         );
         assert_eq!(
             reply(&q.ask, &Answer::Text("no".into())),
+            Reply::Done(json!({"action":"decline"}))
+        );
+        // Words outside the enum decline; a value past the buttons shown still counts.
+        assert_eq!(
+            reply(&q_enum(&["red", "blue"]).ask, &Answer::Text("green".into())),
+            Reply::Done(json!({"action":"decline"}))
+        );
+        let many: Vec<String> = (0..12).map(|i| format!("v{i}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        let q = q_enum(&many);
+        assert_eq!(q.options.len(), MAX_OPTIONS);
+        assert_eq!(
+            reply(&q.ask, &Answer::Text("v11".into())),
+            Reply::Done(json!({"action":"accept","content":{"color":"v11"}}))
+        );
+        // A long value shows shortened, and its button sends the whole value back.
+        let long = "x".repeat(MAX_OPTION + 20);
+        let q = q_enum(&[long.as_str(), "short"]);
+        assert_eq!(q.options[0].chars().count(), MAX_OPTION);
+        assert_eq!(
+            reply(&q.ask, &Answer::Option(q.options[0].clone())),
+            Reply::Done(json!({"action":"accept","content":{"color": long}}))
+        );
+        // Two long values that shorten alike: the label names neither, so it declines.
+        let (a, b) = (format!("{long}a"), format!("{long}b"));
+        let q = q_enum(&[a.as_str(), b.as_str()]);
+        assert_eq!(
+            reply(&q.ask, &Answer::Option(q.options[0].clone())),
+            Reply::Done(json!({"action":"decline"}))
+        );
+        // A Yes/No field takes only yes or no words.
+        let yn = json!({"serverName":"s","threadId":"t","mode":"form","message":"Go?",
+            "requestedSchema":{"type":"object","properties":{"go":{"type":"boolean"}}}});
+        let q = &questions("mcpServer/elicitation/request", &yn, &[]).unwrap()[0];
+        assert_eq!(q.options, vec!["Yes", "No", "Decline"]);
+        assert_eq!(
+            reply(&q.ask, &Answer::Option("No".into())),
+            Reply::Done(json!({"action":"accept","content":{"go":false}}))
+        );
+        assert_eq!(
+            reply(&q.ask, &Answer::Text("yes please".into())),
             Reply::Done(json!({"action":"decline"}))
         );
         let n = json!({"serverName":"s","threadId":"t","mode":"form","message":"How many",
@@ -945,6 +1351,10 @@ mod tests {
         let e = roster_entry(&unnamed).unwrap();
         assert_eq!(e.cwd, "/e");
         assert_eq!(e.name, "Codex 01a19883");
+        // A first prompt never becomes the name: Keo may never have touched the thread.
+        let local =
+            json!({"id":"01a19883-c6d2","cwd":"/e","preview":"my private prompt","name":null});
+        assert_eq!(roster_entry(&local).unwrap().name, "Codex 01a19883");
     }
 
     #[test]

@@ -109,6 +109,23 @@ h2 {
   color: var(--danger);
 }
 
+.list li.session {
+  align-items: baseline;
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
+
+.list li.session .detail {
+  margin: 0;
+  font-size: 0.85em;
+}
+
+.attention {
+  color: var(--accent);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
 button {
   border: 0;
   border-radius: 6px;
@@ -153,7 +170,6 @@ input[type='text'] {
   display: flex;
   gap: 6px;
   align-items: center;
-  white-space: nowrap;
   padding: 3px 0;
 }
 

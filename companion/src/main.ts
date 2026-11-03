@@ -2,6 +2,7 @@
 // of the app's own commands, and the app pushes a `status` event on every change.
 
 import { clearErrorIn, showErrorIn } from './feedback.js';
+import { headerState, sessionRows } from './sessions.js';
 
 interface ToolView {
   tool: string;
@@ -17,6 +18,7 @@ interface Session {
   cwd: string;
   name: string;
   state: string;
+  active_at?: number | null;
 }
 
 interface Status {
@@ -70,10 +72,41 @@ function item(text: string, extra?: HTMLElement): HTMLLIElement {
   return li;
 }
 
+let lastSessions: Session[] = [];
+
+/** The session rows alone: the minute timer redraws only these, so an error line another
+ *  command showed stays put. */
+function renderSessions(list: Session[]): void {
+  lastSessions = list;
+  const { rows, more } = sessionRows(list, Date.now() / 1000);
+  const sessions = $('sessions');
+  sessions.replaceChildren(
+    ...rows.map((r) => {
+      const li = document.createElement('li');
+      li.className = 'session';
+      const text = document.createElement('div');
+      const title = document.createElement('div');
+      title.textContent = r.title;
+      const detail = document.createElement('div');
+      detail.className = 'muted detail';
+      detail.textContent = r.detail;
+      text.append(title, detail);
+      const st = document.createElement('span');
+      st.className = r.attention ? 'attention' : 'muted';
+      st.textContent = r.state;
+      li.append(text, st);
+      return li;
+    }),
+  );
+  $('more-sessions').hidden = more === 0;
+  $('more-sessions').textContent = `+${more} more`;
+  $('no-sessions').hidden = list.length > 0;
+}
+
 function render(s: Status): void {
   $('status').textContent = s.signing_in
     ? 'Finish signing in in your browser.'
-    : (STATE_TEXT[s.state] ?? s.state);
+    : (STATE_TEXT[headerState(s.state, s.sessions)] ?? s.state);
   const err = $('error');
   err.hidden = !s.error;
   err.textContent = s.error ?? '';
@@ -96,16 +129,7 @@ function render(s: Status): void {
     }),
   );
 
-  const sessions = $('sessions');
-  sessions.replaceChildren(
-    ...s.sessions.map((x) => {
-      const st = document.createElement('span');
-      st.className = 'muted';
-      st.textContent = x.state;
-      return item(`${x.name || x.session_id} (${x.tool})`, st);
-    }),
-  );
-  $('no-sessions').hidden = s.sessions.length > 0;
+  renderSessions(s.sessions);
 
   $<HTMLInputElement>('paused').checked = s.paused;
   $<HTMLInputElement>('paused').disabled = !s.signed_in;
@@ -190,7 +214,7 @@ function wire(): void {
     if (!path) return;
     clearErrorIn($('dir-error'));
     void act('add_dir', { path }, 'dir-error').then((ok) => {
-      if (ok) input.value = '';
+      if (ok && input.value.trim() === path) input.value = '';
     });
   });
   $('dir-input').addEventListener('input', () => clearErrorIn($('dir-error')));
@@ -198,6 +222,11 @@ function wire(): void {
 }
 
 wire();
-void tauri.event.listen<Status>('status', (e) => render(e.payload));
-void refresh();
+// Register the listener first, so a push that lands during the first refresh is not missed.
+void tauri.event
+  .listen<Status>('status', (e) => render(e.payload))
+  .catch(() => undefined)
+  .then(() => refresh());
 void loadLog();
+// Ages ("5m ago") move with the clock, not only with a status push.
+setInterval(() => renderSessions(lastSessions), 60_000);

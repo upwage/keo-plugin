@@ -306,6 +306,9 @@ pub struct Persisted {
     pub client_id: Option<String>,
     pub approved_dirs: Vec<PathBuf>,
     pub start_at_login: bool,
+    /// Start at login was set by hand: the first sign-in then keeps that choice instead of
+    /// turning it on.
+    pub start_at_login_chosen: bool,
     pub first_run_done: bool,
     pub paused: bool,
     pub last_roster: Vec<RosterEntry>,
@@ -375,6 +378,25 @@ impl Store {
         write_atomic(&self.path, &serde_json::to_vec_pretty(&next)?)?;
         *guard = next;
         Ok(out)
+    }
+
+    /// `update`, only while `current` holds for the state now, checked under the lock `wipe`
+    /// takes (as `machine_id_if`): a stale caller never writes after a sign-out's wipe.
+    /// `Ok(false)` when it did not write.
+    pub fn update_if(
+        &self,
+        current: impl FnOnce(&Persisted) -> bool,
+        f: impl FnOnce(&mut Persisted),
+    ) -> std::io::Result<bool> {
+        let mut guard = self.data.lock().expect("state lock");
+        if !current(&guard) {
+            return Ok(false);
+        }
+        let mut next = guard.clone();
+        f(&mut next);
+        write_atomic(&self.path, &serde_json::to_vec_pretty(&next)?)?;
+        *guard = next;
+        Ok(true)
     }
 
     /// The machine id, made (and written) on first use.
@@ -460,6 +482,17 @@ mod tests {
         );
         let id = store.machine_id_if(|| true).unwrap().unwrap();
         assert_eq!(store.machine_id_if(|| true).unwrap(), Some(id));
+    }
+
+    #[test]
+    fn a_stale_caller_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::load(dir.path());
+        assert!(!store.update_if(|_| false, |p| p.paused = true).unwrap());
+        assert!(!store.get().paused);
+        assert!(!dir.path().join("state.json").exists(), "no file made");
+        assert!(store.update_if(|_| true, |p| p.paused = true).unwrap());
+        assert!(Store::load(dir.path()).get().paused);
     }
 
     #[test]

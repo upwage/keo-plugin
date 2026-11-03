@@ -73,7 +73,7 @@ releases page.
 Each release has a `SHA256SUMS.txt` file. Compare it with the hash of your file:
 
 - macOS: `shasum -a 256 "Keo Companion_<version>_universal.dmg"`
-- Windows (PowerShell): `Get-FileHash ".<file name>"`
+- Windows (PowerShell): `Get-FileHash ".\Keo Companion_<version>_x64-setup.exe"`
 
 | File | SHA-256 |
 | ---- | ------- |

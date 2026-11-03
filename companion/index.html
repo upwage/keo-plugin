@@ -28,6 +28,7 @@
         <h2>Coding tools and sessions</h2>
         <ul id="tools" class="list"></ul>
         <ul id="sessions" class="list"></ul>
+        <p id="more-sessions" class="muted" hidden></p>
         <p id="no-sessions" class="muted">No sessions yet.</p>
       </section>
 
@@ -50,7 +51,7 @@
       <section class="about">
         <h2>About</h2>
         <p id="version" class="muted"></p>
-        <p>Hosts: askkeo.ai only (plus the update manifest on the same host).</p>
+        <p>Hosts: askkeo.ai only, plus the update check (askkeo.ai, then the release manifest on github.com/upwage/keo-plugin).</p>
         <p>What it sends: session ids, the task text you approved in Slack, tool events, usage numbers, and, for a session Keo started or sent work to, its progress notes, its questions and its last reply. Those can quote code or files from that session.</p>
         <p>No full transcripts, no files read off disk, no vendor tokens. Sessions Keo did not hand work to are never relayed.</p>
         <button id="quit" type="button" class="secondary">Quit Keo Companion</button>

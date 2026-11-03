@@ -5,7 +5,7 @@
 ```sh
 npm install
 npm run dev            # the customer app
-npm run dev:staging    # the team's staging app (its own bundle id, sign-in and Keo host)
+npm run dev:staging    # Upwage team checkout only: its config is not in this repository
 ```
 
 On macOS, if the Xcode license is not accepted, prefix the command with
@@ -27,7 +27,7 @@ keychain keeps its trust. Choose **Always Allow** at the first prompt, and it do
 The identity is the first one found, in this order:
 
 1. The `APPLE_SIGNING_IDENTITY` environment variable.
-2. `bundle.macOS.signingIdentity` in `src-tauri/tauri.conf.json` (empty in this repository; do not
+2. `bundle.macOS.signingIdentity` in `src-tauri/tauri.conf.json`, or in a `--config` file given to the script (empty in this repository; do not
    commit a personal identity).
 3. The first `Developer ID Application` identity in your keychain.
 4. The first `Apple Development` identity in your keychain. It works as well as a Developer ID for

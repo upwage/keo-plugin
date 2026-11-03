@@ -134,8 +134,13 @@ fn request_target(head: &str) -> Option<&str> {
     parts.next()
 }
 
-/// Accept connections until one is `GET /callback`, answer it, and return its parameters.
-async fn wait_for_callback(listener: TcpListener) -> Result<CallbackParams, AuthError> {
+/// Accept connections until one is `GET /callback` carrying this sign-in's `state`, answer it,
+/// and return its parameters. A callback with any other `state` (another local process can reach
+/// the port) is answered 404 and the wait goes on; Keo sends `state` on error redirects too.
+async fn wait_for_callback(
+    listener: TcpListener,
+    state: &str,
+) -> Result<CallbackParams, AuthError> {
     let accept_loop = async {
         loop {
             let (mut sock, _) = listener
@@ -161,7 +166,9 @@ async fn wait_for_callback(listener: TcpListener) -> Result<CallbackParams, Auth
                 }
             }
             let head = String::from_utf8_lossy(&buf[..len]).to_string();
-            let params = request_target(&head).and_then(parse_callback);
+            let params = request_target(&head)
+                .and_then(parse_callback)
+                .filter(|p| p.state.as_deref() == Some(state));
             let (status, body) = match &params {
                 Some(p) if p.error.is_some() => (
                     "200 OK",
@@ -504,7 +511,7 @@ impl Auth {
         tracing::info!("sign-in: waiting for the browser");
 
         let params = tokio::select! {
-            params = wait_for_callback(listener) => params?,
+            params = wait_for_callback(listener, &state) => params?,
             _ = cancelled.changed() => {
                 tracing::info!("sign-in: cancelled");
                 return Err(AuthError::Superseded);
@@ -1122,9 +1129,14 @@ mod tests {
     async fn loopback_answers_and_returns_params() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let server = tokio::spawn(wait_for_callback(listener));
-        // A stray request first, then the real one.
-        for path in ["/favicon.ico", "/callback?code=abc&state=xyz"] {
+        let server = tokio::spawn(async move { wait_for_callback(listener, "xyz").await });
+        // Stray requests first (a callback with another state is one), then the real one.
+        for path in [
+            "/favicon.ico",
+            "/callback?code=wrong&state=wrong",
+            "/callback?code=none",
+            "/callback?code=abc&state=xyz",
+        ] {
             let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
                 .await
                 .unwrap();
@@ -1133,7 +1145,8 @@ mod tests {
                 .unwrap();
             let mut out = String::new();
             s.read_to_string(&mut out).await.unwrap();
-            assert!(out.starts_with("HTTP/1.1 "));
+            let real = path.ends_with("state=xyz");
+            assert_eq!(out.starts_with("HTTP/1.1 200"), real, "{path}");
         }
         let p = server.await.unwrap().unwrap();
         assert_eq!(p.code.as_deref(), Some("abc"));

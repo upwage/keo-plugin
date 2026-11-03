@@ -11,8 +11,9 @@ newer than the newest version tested, in which case the companion itself needs a
 
 Status: scaffold. Sign-in, the doorbell, the inbox and the registry are in place. The Codex runner
 drives its own `codex app-server` (0.158.0 or newer) on a loopback websocket: it starts sessions,
-sends, steers, stops, and relays approvals and questions. The Claude Code runner only detects the
-installed version for now.
+sends, steers, stops, and relays approvals and questions. The Claude Code runner drives its own `claude -p` session
+over stream-json: it starts sessions, sends messages, interrupts, and relays progress, questions
+and answers. It needs the `claude` command on the PATH, at a version this build supports.
 
 ## Install (development build)
 
@@ -86,7 +87,7 @@ this machine. Your choice is kept across restarts.
   - `log.rs`: the daily log.
   - `runner/`: one file per coding tool, behind the `Runner` trait. `runner/codex/` holds the Codex
     runner's websocket client, app-server launcher, frame mapping and its fake-server tests.
-- `scripts/gen-icons.mjs`: draws the tray and app icons.
+- `scripts/gen-icons.mjs`: draws the 1024x1024 app icon source (`src-tauri/icons/source.png`). The tray icons come from `src-tauri/icons/tray/build.py`.
 - `scripts/gen-codex-types.sh`: writes the Codex app-server JSON Schema for the Codex runner.
 
 ## Configuration

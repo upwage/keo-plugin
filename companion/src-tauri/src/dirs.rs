@@ -61,13 +61,18 @@ pub fn remove(list: &mut Vec<PathBuf>, dir: &Path) -> bool {
 /// Whether `cwd` is one of the approved folders or inside one. `cwd` is canonicalized first, so
 /// `..` and symlinks cannot step outside; a path that does not exist is never inside.
 pub fn contains(list: &[PathBuf], cwd: &Path) -> bool {
+    admit(list, cwd).is_some()
+}
+
+/// The canonical form of `cwd` when it is inside an approved folder (see [`contains`]). A
+/// launch uses this path, never `cwd` as given: a symlink in `cwd` swapped after the check then
+/// cannot move the launch elsewhere.
+pub fn admit(list: &[PathBuf], cwd: &Path) -> Option<PathBuf> {
     if !cwd.is_absolute() {
-        return false;
+        return None;
     }
-    let Ok(canon) = cwd.canonicalize() else {
-        return false;
-    };
-    list.iter().any(|d| canon.starts_with(d))
+    let canon = cwd.canonicalize().ok()?;
+    list.iter().any(|d| canon.starts_with(d)).then_some(canon)
 }
 
 #[cfg(test)]
@@ -159,6 +164,15 @@ mod tests {
             let link = approved.join("escape");
             std::os::unix::fs::symlink(&sibling, &link).unwrap();
             assert!(!contains(&list, &link));
+            // A link that stays inside is admitted as its canonical target, which is what runs.
+            let inside = approved.join("to-repo");
+            std::os::unix::fs::symlink(&inner, &inside).unwrap();
+            assert_eq!(admit(&list, &inside), Some(inner.clone()));
         }
+        assert_eq!(
+            admit(&list, &inner.join("..").join("repo")),
+            Some(inner.clone())
+        );
+        assert_eq!(admit(&list, &sibling), None);
     }
 }

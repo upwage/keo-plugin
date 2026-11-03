@@ -7,11 +7,15 @@
 //!   plugin and its doorbell, unchanged) stay their channel.
 //! - Start: the companion owns the session as a child process,
 //!   `claude -p --input-format stream-json --output-format stream-json --verbose
-//!   --include-hook-events --permission-prompt-tool stdio --session-id <v4> --name <name>`, in the
-//!   approved folder. `claude --bg` cannot be used: it refuses `-p`, and it has no stream, so
+//!   --include-hook-events --permission-prompt-tool stdio --permission-mode auto --session-id <v4>
+//!   --name <name>`, in the approved folder. The Slack Allow that started it is the person's one
+//!   approval: auto mode runs each tool call without asking (Claude Code's own safety check
+//!   stops the risky ones and tells the model why), so web fetches, searches, edits and commands
+//!   do not become Slack cards. `claude --bg` cannot be used: it refuses `-p`, and it has no stream, so
 //!   no progress and no questions (both recorded on Claude Code 2.1.316). Without
 //!   `--permission-prompt-tool stdio` every permission ask is denied at once.
-//! - Questions: the stream's `control_request` `can_use_tool` (a permission ask) and
+//! - Questions: the stream's `control_request` `can_use_tool` (a permission ask that still
+//!   reaches the host: its card says which mode the session is in) and
 //!   `elicitation` (an MCP server's form), each with a fresh v4 `prompt_id`. `answer()` writes the
 //!   `control_response`; no answer in `QUESTION_TIMEOUT` declines.
 //! - Turn end: the `result` frame (read `is_error` and `terminal_reason`, never `subtype`).
@@ -28,14 +32,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::broadcast;
 
 use super::{
-    child_path, detect_tool, find_binary, Answer, Detection, RosterEntry, Runner, RunnerError,
-    RunnerEvent, SessionPolicy, SessionState, StartRequest, ToolKind,
+    child_path, detect_tool, find_binary, now_secs, Answer, Detection, RosterEntry, Runner,
+    RunnerError, RunnerEvent, SessionPolicy, SessionState, StartRequest, ToolKind,
 };
 
 const KIND: ToolKind = ToolKind::ClaudeCode;
@@ -44,8 +48,15 @@ const KIND: ToolKind = ToolKind::ClaudeCode;
 const QUESTION_TIMEOUT: Duration = Duration::from_secs(35 * 60);
 /// A write to a session's input that takes longer gives the session up.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
-/// Longest command, path or message quoted in a question.
+/// The permission mode a Keo-started session runs in: one Allow in Slack, then no per-tool asks.
+const PERMISSION_MODE: &str = "auto";
+/// Longest description or message quoted in a question.
 const QUOTE_MAX: usize = 600;
+/// Keo's cap on a question's text (the Codex runner's `MAX_TEXT`).
+const QUESTION_MAX: usize = 2_000;
+/// Said when a permission ask cannot be shown whole in one Keo question: Allow must never
+/// approve what the person could not read, so only Deny stays.
+const TOO_LONG: &str = "\nThis request cannot be shown here in full, so Slack can only deny it.";
 
 /// Variables a session started from inside Claude Code would inherit and misread as "nested".
 const NESTED_ENV: &[&str] = &[
@@ -104,6 +115,8 @@ struct Child {
     /// Shown in `list()` once its first message went in.
     announced: bool,
     busy: bool,
+    /// Last turn start or end (Unix seconds), for the panel's order.
+    active_at: i64,
     /// Steer text waiting for the turn's end.
     queued: Vec<String>,
 }
@@ -118,10 +131,23 @@ struct Pending {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Ask {
-    /// A permission ask; `input` goes back unchanged on Allow.
-    Tool { input: Value },
-    /// An MCP elicitation form.
-    Elicit { schema: Value, options: Vec<String> },
+    /// A permission ask; `input` goes back unchanged on Allow. `allow` is false when the
+    /// question could not show the request in full: then every answer denies.
+    Tool { input: Value, allow: bool },
+    /// An MCP elicitation form, read by `form::parse` once when it arrives.
+    Elicit { form: Form, options: Vec<String> },
+}
+
+/// What an elicitation answer may send back.
+#[derive(Debug, Clone, PartialEq)]
+enum Form {
+    /// A form this cannot read in full (no schema, another mode, a rule nobody here checks, or
+    /// several fields): every answer declines.
+    DeclineOnly,
+    /// A form of no fields: Accept sends empty content.
+    Confirm,
+    /// A form of one field: an answer must be a value it takes.
+    One(super::form::Field),
 }
 
 impl ClaudeRunner {
@@ -188,12 +214,13 @@ fn iso_utc(secs: i64) -> String {
     )
 }
 
+/// `s` cut to `max` UTF-16 units (how Keo measures a question), marking the cut.
 fn clip(s: &str, max: usize) -> String {
     let s = s.trim();
-    if s.chars().count() <= max {
+    if super::units(s) <= max {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(max).collect();
+    let mut out = super::prefix_units(s, max.saturating_sub(1)).to_string();
     out.push('…');
     out
 }
@@ -395,6 +422,8 @@ struct Stream {
     session_id: String,
     last_text: Option<String>,
     last_progress: Option<String>,
+    /// The permission mode the session reported at start (`system` `init`).
+    mode: Option<String>,
 }
 
 impl Stream {
@@ -403,6 +432,7 @@ impl Stream {
             session_id: session_id.to_string(),
             last_text: None,
             last_progress: None,
+            mode: None,
         }
     }
 
@@ -428,6 +458,10 @@ impl Stream {
                 Vec::new()
             }
             Some("system") => match s("subtype") {
+                Some("init") => {
+                    self.mode = s("permissionMode").map(str::to_string);
+                    Vec::new()
+                }
                 // A short line Claude Code writes for each step: exactly a progress note.
                 Some("task_summary") => {
                     let Some(detail) = s("detail").map(str::trim).filter(|d| !d.is_empty()) else {
@@ -451,23 +485,24 @@ impl Stream {
                 let r = f.get("request").cloned().unwrap_or(Value::Null);
                 match r.get("subtype").and_then(Value::as_str) {
                     Some("can_use_tool") => {
-                        let (text, options) = tool_question(&r);
+                        let (text, options) = tool_question(&r, self.mode.as_deref());
+                        let allow = options.iter().any(|o| o == ALLOW);
                         vec![Out::Ask {
                             request_id,
                             ask: Ask::Tool {
                                 input: r.get("input").cloned().unwrap_or_else(|| json!({})),
+                                allow,
                             },
                             text,
                             options,
                         }]
                     }
                     Some("elicitation") => {
-                        let schema = r.get("requested_schema").cloned().unwrap_or(Value::Null);
-                        let (text, options) = elicit_question(&r, &schema);
+                        let (text, form, options) = elicit_question(&r);
                         vec![Out::Ask {
                             request_id,
                             ask: Ask::Elicit {
-                                schema,
+                                form,
                                 options: options.clone(),
                             },
                             text,
@@ -546,63 +581,130 @@ fn usage_of(f: &Value) -> Vec<Out> {
 
 const ALLOW: &str = "Allow";
 const DENY: &str = "Deny";
+const ACCEPT: &str = "Accept";
+const DECLINE: &str = "Decline";
 
-fn tool_question(r: &Value) -> (String, Vec<String>) {
+/// Why a session started in `PERMISSION_MODE` still asked about a tool, for the card: the mode it
+/// actually runs in (`mode`, from its `init` frame) and what that means.
+fn mode_note(mode: Option<&str>) -> String {
+    match mode {
+        Some(PERMISSION_MODE) => {
+            "Auto mode is on, and Claude Code still asked about this step.".to_string()
+        }
+        Some(m) => {
+            format!("This session runs in {m} mode, not auto mode, so it asks before a tool.")
+        }
+        None => "Claude Code did not say which permission mode it runs in, so it asks before a \
+             tool."
+            .to_string(),
+    }
+}
+
+/// The permission question. Allow sends the whole `input` back as approved, so the text shows
+/// all of it as it is: the main field (command, path, URL or pattern) quoted, every other field
+/// as `key: value` JSON. When that does not fit one Keo question, or the main field cannot be
+/// quoted without changing it, the text is cut and only Deny is offered.
+fn tool_question(r: &Value, mode: Option<&str>) -> (String, Vec<String>) {
     let s = |k: &str| r.get(k).and_then(Value::as_str).map(str::trim);
-    let tool = s("display_name")
-        .filter(|t| !t.is_empty())
-        .or(s("tool_name"))
-        .unwrap_or("a tool");
+    // The tool Allow approves is `tool_name`: it is always named, and a display name only adds to
+    // it. With no tool name, or an input that is not an object, nothing granted is known.
+    let tool_name = s("tool_name").filter(|t| !t.is_empty());
+    let mut shown = tool_name.is_some() && r.get("input").is_some_and(Value::is_object);
+    let tool = match (s("display_name").filter(|t| !t.is_empty()), tool_name) {
+        (Some(d), Some(t)) if d != t => format!("{d} ({t})"),
+        (_, Some(t)) => t.to_string(),
+        (Some(d), None) => d.to_string(),
+        (None, None) => "a tool".to_string(),
+    };
     let mut text = format!("Claude Code wants to use {tool}");
-    if let Some(d) = s("description").filter(|d| !d.is_empty()) {
-        text.push_str(&format!(": {}", clip(d, QUOTE_MAX)));
+    let description = s("description").filter(|d| !d.is_empty());
+    if let Some(d) = description {
+        text.push_str(&format!(": {d}"));
     }
-    let input = r.get("input");
-    let detail = ["command", "file_path", "path", "url", "pattern"]
+    let empty = Map::new();
+    let input = r.get("input").unwrap_or(&Value::Null);
+    let fields = input.as_object().unwrap_or(&empty);
+    let main = ["command", "file_path", "path", "url", "pattern"]
         .iter()
-        .find_map(|k| input?.get(k)?.as_str().filter(|v| !v.trim().is_empty()));
-    if let Some(d) = detail {
-        text.push_str(&format!("\n`{}`", clip(d, QUOTE_MAX).replace('`', "'")));
+        .find(|k| {
+            fields
+                .get(**k)
+                .and_then(Value::as_str)
+                .is_some_and(|v| !v.trim().is_empty())
+        });
+    if !input.is_object() && !input.is_null() {
+        text.push_str(&format!("\n{input}"));
     }
-    (text, vec![ALLOW.to_string(), DENY.to_string()])
+    if let Some(key) = main {
+        let v = fields[*key].as_str().unwrap_or("");
+        if !v.contains(['`', '\n']) && v.trim() == v {
+            text.push_str(&format!("\n`{v}`"));
+        } else if !v.contains("```") {
+            text.push_str(&format!("\n```\n{v}\n```"));
+        } else {
+            text.push_str(&format!("\n{}", clip(&v.replace('`', "'"), QUOTE_MAX)));
+            shown = false;
+        }
+    }
+    for (k, v) in fields {
+        // The main field is quoted above; Bash's own description is the one already shown.
+        let repeated = k == "description" && v.as_str().map(str::trim) == description;
+        if main.is_some_and(|m| m == k) || repeated {
+            continue;
+        }
+        text.push_str(&format!("\n{k}: {v}"));
+    }
+    let note = format!("\n{}", mode_note(mode));
+    let whole = format!("{text}{note}");
+    if shown && super::units(&whole) <= QUESTION_MAX {
+        return (whole, vec![ALLOW.to_string(), DENY.to_string()]);
+    }
+    let room = QUESTION_MAX.saturating_sub(super::units(&note) + super::units(TOO_LONG) + 1);
+    (
+        format!("{}{note}{TOO_LONG}", clip(&text, room.max(1))),
+        vec![DENY.to_string()],
+    )
 }
 
-/// The one field of an elicitation form, when it has exactly one.
-fn single_field(schema: &Value) -> Option<(&String, &Value)> {
-    let props = schema.get("properties")?.as_object()?;
-    if props.len() == 1 {
-        props.iter().next()
-    } else {
-        None
-    }
-}
-
-fn elicit_question(r: &Value, schema: &Value) -> (String, Vec<String>) {
+/// The question for an elicitation, what its answer may send, and its options. The schema is
+/// checked by `form::parse`, the same check the Codex runner makes: anything outside the subset
+/// it reads can only be declined.
+fn elicit_question(r: &Value) -> (String, Form, Vec<String>) {
     let message = r
         .get("message")
         .and_then(Value::as_str)
         .map(|m| clip(m, QUOTE_MAX))
         .unwrap_or_else(|| "A tool asks for an answer.".to_string());
-    let text = match r.get("mcp_server_name").and_then(Value::as_str) {
+    let mut text = match r.get("mcp_server_name").and_then(Value::as_str) {
         Some(server) if !server.is_empty() => format!("{message} (asked by {server})"),
         _ => message,
     };
-    let options = match single_field(schema) {
-        Some((_, p)) if p.get("enum").is_some() => p["enum"]
-            .as_array()
-            .map(|e| {
-                e.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default(),
-        Some((_, p)) if p.get("type").and_then(Value::as_str) == Some("boolean") => {
+    // A form is the protocol's default mode; any other (a link to open, say) is not read here.
+    let form_mode = r.get("mode").map_or(true, |m| m.as_str() == Some("form"));
+    let fields = r
+        .get("requested_schema")
+        .filter(|_| form_mode)
+        .map(super::form::parse);
+    let form = match fields {
+        Some(Ok(fields)) => match <[_; 1]>::try_from(fields) {
+            Ok([field]) => Form::One(field),
+            Err(fields) if fields.is_empty() => Form::Confirm,
+            Err(_) => Form::DeclineOnly,
+        },
+        _ => Form::DeclineOnly,
+    };
+    let options = match &form {
+        Form::DeclineOnly => {
+            text.push_str("\nThis form asks for an answer Slack cannot give: answer it at the machine, or decline it here.");
+            vec![DECLINE.to_string()]
+        }
+        Form::Confirm => vec![ACCEPT.to_string(), DECLINE.to_string()],
+        Form::One(f) if f.kind == super::form::Kind::Boolean => {
             vec!["Yes".to_string(), "No".to_string()]
         }
-        _ => Vec::new(),
+        Form::One(f) => f.values.iter().map(|v| super::form::label(v)).collect(),
     };
-    (text, options)
+    (text, form, options)
 }
 
 /// The words of an answer, with an option's index read as its label.
@@ -637,11 +739,12 @@ fn answer_words(answer: &Answer, options: &[String]) -> Option<String> {
 /// The `response` body of the `control_response` that answers `ask`.
 fn response_for(ask: &Ask, answer: &Answer) -> Value {
     match ask {
-        Ask::Tool { input } => {
+        Ask::Tool { input, allow } => {
             let words = answer_words(answer, &[ALLOW.to_string(), DENY.to_string()]);
-            let allow = words.as_deref().is_some_and(|w| {
-                ["allow", "yes", "approve", "ok"].contains(&w.to_lowercase().as_str())
-            });
+            let allow = *allow
+                && words.as_deref().is_some_and(|w| {
+                    ["allow", "yes", "approve", "ok"].contains(&w.to_lowercase().as_str())
+                });
             if allow {
                 return json!({"behavior": "allow", "updatedInput": input});
             }
@@ -656,39 +759,28 @@ fn response_for(ask: &Ask, answer: &Answer) -> Value {
             };
             json!({"behavior": "deny", "message": message})
         }
-        Ask::Elicit { schema, options } => {
+        Ask::Elicit { form, options } => {
             let decline = json!({"action": "decline"});
             let Some(words) = answer_words(answer, options) else {
                 return decline;
             };
-            if let Some((name, p)) = single_field(schema) {
-                let value = match p.get("type").and_then(Value::as_str) {
-                    Some("boolean") => match words.to_lowercase().as_str() {
-                        "yes" | "true" | "y" => json!(true),
-                        "no" | "false" | "n" => json!(false),
-                        _ => return decline,
-                    },
-                    Some("number") => match words.parse::<f64>() {
-                        Ok(n) => json!(n),
-                        Err(_) => return decline,
-                    },
-                    Some("integer") => match words.parse::<i64>() {
-                        Ok(n) => json!(n),
-                        Err(_) => return decline,
-                    },
-                    _ => {
-                        if !options.is_empty() && !options.contains(&words) {
-                            return decline;
-                        }
-                        json!(words)
-                    }
-                };
-                return json!({"action": "accept", "content": {name: value}});
+            if words.eq_ignore_ascii_case(DECLINE) {
+                return decline;
             }
-            // A form of several fields takes a JSON object typed as the answer.
-            match serde_json::from_str::<Value>(&words) {
-                Ok(v) if v.is_object() => json!({"action": "accept", "content": v}),
-                _ => decline,
+            match form {
+                Form::DeclineOnly => decline,
+                Form::Confirm if words.eq_ignore_ascii_case(ACCEPT) => {
+                    json!({"action": "accept", "content": {}})
+                }
+                Form::Confirm => decline,
+                // Only a value the field takes is sent: a listed value (a shortened label maps
+                // back to the one value it stands for), a whole or finite number, yes or no.
+                Form::One(field) => match super::form::coerce(field, &words) {
+                    Some(value) => {
+                        json!({"action": "accept", "content": {field.name.clone(): value}})
+                    }
+                    None => decline,
+                },
             }
         }
     }
@@ -712,6 +804,7 @@ impl Inner {
     /// A `claude` command with the GUI's thin PATH widened and nested-session variables removed.
     fn command(&self, bin: &PathBuf) -> Command {
         let mut cmd = Command::new(bin);
+        super::no_window(&mut cmd);
         if let Some(path) = child_path(bin) {
             cmd.env("PATH", path);
         }
@@ -759,7 +852,7 @@ impl Inner {
     /// roster (`start` keeps it off until then).
     async fn send_user(&self, session_id: &str, text: &str) -> Result<(), RunnerError> {
         self.write(session_id, &user_frame(text)).await?;
-        let first = match self
+        let listed = match self
             .children
             .lock()
             .expect("children lock")
@@ -767,14 +860,31 @@ impl Inner {
         {
             Some(c) => {
                 c.busy = true;
-                !std::mem::replace(&mut c.announced, true)
+                c.active_at = now_secs();
+                c.announced = true;
+                true
             }
             None => false,
         };
-        if first {
+        // The first message lists the session; every later one turns it to working.
+        if listed {
             self.emit(RunnerEvent::RosterChanged { tool: KIND });
         }
         Ok(())
+    }
+
+    /// The roster's state for session `id` changed (a turn ended, a question opened or closed):
+    /// tell the registry, once the session is listed.
+    fn roster_changed(&self, id: &str) {
+        let listed = self
+            .children
+            .lock()
+            .expect("children lock")
+            .get(id)
+            .is_some_and(|c| c.announced);
+        if listed {
+            self.emit(RunnerEvent::RosterChanged { tool: KIND });
+        }
     }
 
     /// The sessions this runner started, once their first message went in.
@@ -791,6 +901,7 @@ impl Inner {
                 name: c.name.clone(),
                 state: own_state(c, id, &prompts),
                 pid: c.pid,
+                active_at: Some(c.active_at),
             })
             .collect();
         list.sort_by(|a, b| a.session_id.cmp(&b.session_id));
@@ -845,6 +956,7 @@ impl Inner {
                     text,
                     options,
                 });
+                self.roster_changed(id);
                 let me = Arc::downgrade(self);
                 let wait = self.opts.question_timeout;
                 tokio::spawn(async move {
@@ -861,6 +973,7 @@ impl Inner {
                     .lock()
                     .expect("prompts lock")
                     .retain(|_, p| !(p.session_id == id && p.request_id == request_id));
+                self.roster_changed(id);
             }
             Out::Refuse { request_id } => {
                 let frame = json!({
@@ -882,8 +995,10 @@ impl Inner {
                         return;
                     };
                     c.busy = false;
+                    c.active_at = now_secs();
                     std::mem::take(&mut c.queued)
                 };
+                self.roster_changed(id);
                 if !queued.is_empty() {
                     if let Err(e) = self.send_user(id, &queued.join("\n\n")).await {
                         tracing::warn!(error = %e, "claude: queued message not sent");
@@ -921,6 +1036,8 @@ impl Inner {
                     .expect("prompts lock")
                     .insert(prompt_id.to_string(), pending);
             }
+        } else {
+            self.roster_changed(&pending.session_id);
         }
         sent
     }
@@ -1009,6 +1126,8 @@ impl Runner for ClaudeRunner {
             "--include-hook-events",
             "--permission-prompt-tool",
             "stdio",
+            "--permission-mode",
+            PERMISSION_MODE,
             "--session-id",
             &id,
             "--name",
@@ -1039,6 +1158,7 @@ impl Runner for ClaudeRunner {
                 pid: child.id(),
                 announced: false,
                 busy: false,
+                active_at: now_secs(),
                 queued: Vec::new(),
             },
         );
@@ -1185,6 +1305,134 @@ mod tests {
         frames(src).iter().flat_map(|f| s.on_frame(f)).collect()
     }
 
+    /// A permission ask that reaches the host in auto mode says auto mode is on; one with no
+    /// `init` before it says the mode is unknown.
+    #[test]
+    fn a_permission_ask_names_the_mode_it_came_from() {
+        let ask = json!({"type": "control_request", "request_id": "r1", "request": {
+            "subtype": "can_use_tool", "tool_name": "Bash", "input": {"command": "ls"}}});
+        let text_of = |outs: Vec<Out>| match outs.into_iter().next() {
+            Some(Out::Ask { text, .. }) => text,
+            other => panic!("not an ask: {other:?}"),
+        };
+        let mut s = Stream::new("s1");
+        assert!(s
+            .on_frame(&json!({"type": "system", "subtype": "init", "permissionMode": "auto"}))
+            .is_empty());
+        let text = text_of(s.on_frame(&ask));
+        assert_eq!(
+            text,
+            "Claude Code wants to use Bash\n`ls`\nAuto mode is on, and Claude Code still asked about this step."
+        );
+        let text = text_of(Stream::new("s2").on_frame(&ask));
+        assert!(text
+            .ends_with("did not say which permission mode it runs in, so it asks before a tool."));
+    }
+
+    /// Allow approves the whole input, so a command shows whole; one too long for a question
+    /// can only be denied from Slack.
+    #[test]
+    fn a_command_too_long_to_show_whole_can_only_be_denied() {
+        let ask_for = |command: &str| {
+            let f = json!({"type": "control_request", "request_id": "r1", "request": {
+                "subtype": "can_use_tool", "tool_name": "Bash", "input": {"command": command}}});
+            match Stream::new("s1").on_frame(&f).into_iter().next() {
+                Some(Out::Ask {
+                    ask, text, options, ..
+                }) => (ask, text, options),
+                other => panic!("not an ask: {other:?}"),
+            }
+        };
+        let long = format!("echo {}; touch hidden-step", "a".repeat(900));
+        let (ask, text, options) = ask_for(&long);
+        assert!(text.contains("touch hidden-step"), "shown whole: {text}");
+        assert_eq!(options, vec![ALLOW, DENY]);
+        assert_eq!(
+            response_for(&ask, &Answer::Option(ALLOW.into()))["behavior"],
+            "allow"
+        );
+        let huge = format!("echo {}; touch hidden-step", "a".repeat(3_000));
+        let (ask, text, options) = ask_for(&huge);
+        assert!(text.chars().count() <= QUESTION_MAX);
+        assert!(!text.contains("hidden-step"));
+        assert!(text.ends_with("so Slack can only deny it."));
+        assert_eq!(options, vec![DENY]);
+        // Keo cuts a question at 2000 UTF-16 units: an emoji counts two, so ~1000 of them under
+        // 2000 characters still hide the tail, and the question is deny-only.
+        let emoji = format!("echo {}; touch hidden-step", "😀".repeat(990));
+        assert!(emoji.chars().count() < QUESTION_MAX);
+        let (_, text, options) = ask_for(&emoji);
+        assert!(super::super::units(&text) <= QUESTION_MAX);
+        assert!(!text.contains("hidden-step"));
+        assert_eq!(options, vec![DENY]);
+        // Every field Allow would send back is in the text, so none hides behind the command.
+        let f = json!({"type": "control_request", "request_id": "r1", "request": {
+            "subtype": "can_use_tool", "tool_name": "Bash", "description": "List",
+            "input": {"command": "ls", "description": "List", "dangerouslyDisableSandbox": true}}});
+        let Some(Out::Ask { text, options, .. }) =
+            Stream::new("s1").on_frame(&f).into_iter().next()
+        else {
+            panic!("not an ask")
+        };
+        assert!(text.contains("\ndangerouslyDisableSandbox: true"), "{text}");
+        assert!(
+            !text.contains("description:"),
+            "the shown description is not repeated"
+        );
+        assert_eq!(options, vec![ALLOW, DENY]);
+        // A long description is shown whole too, or the question is deny-only.
+        let f = json!({"type": "control_request", "request_id": "r1", "request": {
+            "subtype": "can_use_tool", "tool_name": "Bash", "description": "d".repeat(2_500),
+            "input": {"command": "ls"}}});
+        let Some(Out::Ask { options, .. }) = Stream::new("s1").on_frame(&f).into_iter().next()
+        else {
+            panic!("not an ask")
+        };
+        assert_eq!(options, vec![DENY]);
+        // A command that breaks its quoting cannot be shown as it is.
+        let (_, _, options) = ask_for("echo ``` touch hidden-step");
+        assert_eq!(options, vec![DENY]);
+        let (_, text, options) = ask_for("printf 'a`b'");
+        assert!(text.contains("```\nprintf 'a`b'\n```"), "{text}");
+        assert_eq!(options, vec![ALLOW, DENY]);
+        // The tool Allow approves is always named; with no tool name or no input object,
+        // nothing granted is known.
+        for request in [
+            json!({"subtype": "can_use_tool", "display_name": "Read", "input": {"file_path": "a"}}),
+            json!({"subtype": "can_use_tool", "tool_name": "Bash"}),
+            json!({"subtype": "can_use_tool", "tool_name": "Bash", "input": "ls"}),
+        ] {
+            let f = json!({"type": "control_request", "request_id": "r1", "request": request});
+            let Some(Out::Ask { options, ask, .. }) =
+                Stream::new("s1").on_frame(&f).into_iter().next()
+            else {
+                panic!("not an ask")
+            };
+            assert_eq!(options, vec![DENY], "{f}");
+            assert_eq!(
+                response_for(&ask, &Answer::Option(ALLOW.into()))["behavior"],
+                "deny"
+            );
+        }
+        let f = json!({"type": "control_request", "request_id": "r1", "request": {
+            "subtype": "can_use_tool", "tool_name": "Bash", "display_name": "Read",
+            "input": {"command": "ls"}}});
+        let Some(Out::Ask { text, .. }) = Stream::new("s1").on_frame(&f).into_iter().next() else {
+            panic!("not an ask")
+        };
+        assert!(
+            text.starts_with("Claude Code wants to use Read (Bash)"),
+            "{text}"
+        );
+        for a in [ALLOW, "yes", "0"] {
+            assert_eq!(
+                response_for(&ask, &Answer::Option(a.into()))["behavior"],
+                "deny",
+                "{a}"
+            );
+        }
+    }
+
     fn turn_text(outs: &[Out]) -> Vec<Option<String>> {
         outs.iter()
             .filter_map(|o| match o {
@@ -1214,6 +1462,10 @@ mod tests {
         assert_eq!(request_id, "98bfd709-047e-4450-abab-daeda6b48c60");
         assert!(text.starts_with("Claude Code wants to use Bash: Write spike-permission"));
         assert!(text.contains("`echo spike-permission > spike-perm.txt`"));
+        // Recorded in default mode: the card says auto mode is not what this session runs in.
+        assert!(text.ends_with(
+            "This session runs in default mode, not auto mode, so it asks before a tool."
+        ));
         assert_eq!(options, &vec!["Allow".to_string(), "Deny".to_string()]);
         // Allow sends the input back unchanged, as the spike's host did.
         let allow = response_for(ask, &Answer::Option("Allow".into()));
@@ -1301,34 +1553,80 @@ mod tests {
 
     #[test]
     fn elicitation_forms_of_other_shapes() {
-        let free = Ask::Elicit {
-            schema: json!({"type": "object", "properties": {"why": {"type": "string"}}}),
-            options: vec![],
+        let ask = |schema: Value| {
+            let r = json!({"message": "m", "mode": "form", "requested_schema": schema});
+            let (text, form, options) = elicit_question(&r);
+            (text, Ask::Elicit { form, options })
         };
+        let (_, free) = ask(json!({"type": "object", "properties": {"why": {"type": "string"}}}));
         assert_eq!(
             response_for(&free, &Answer::Text("because".into())),
             json!({"action": "accept", "content": {"why": "because"}})
         );
-        let flag = Ask::Elicit {
-            schema: json!({"properties": {"ok": {"type": "boolean"}}}),
-            options: vec!["Yes".into(), "No".into()],
-        };
+        let (_, flag) = ask(json!({"type": "object", "properties": {"ok": {"type": "boolean"}}}));
         assert_eq!(
             response_for(&flag, &Answer::Option("1".into())),
             json!({"action": "accept", "content": {"ok": false}})
         );
-        let many = Ask::Elicit {
-            schema: json!({"properties": {"a": {}, "b": {}}}),
-            options: vec![],
-        };
+        let (_, n) = ask(json!({"type": "object", "properties": {"n": {"type": "number"}}}));
         assert_eq!(
-            response_for(&many, &Answer::Text(r#"{"a":1,"b":2}"#.into())),
-            json!({"action": "accept", "content": {"a": 1, "b": 2}})
-        );
-        assert_eq!(
-            response_for(&many, &Answer::Text("a is 1".into())),
+            response_for(&n, &Answer::Text("NaN".into())),
             json!({"action": "decline"})
         );
+        let (_, confirm) = ask(json!({"type": "object", "properties": {}}));
+        assert_eq!(
+            response_for(&confirm, &Answer::Option("Accept".into())),
+            json!({"action": "accept", "content": {}})
+        );
+        assert_eq!(
+            response_for(&confirm, &Answer::Text("sure".into())),
+            json!({"action": "decline"})
+        );
+        // No schema, another mode, several fields, a root that is no object form, or a rule
+        // nobody here checks: Decline is the one option and every answer declines.
+        let r = json!({"message": "m", "mode": "url", "requested_schema": {"type": "object", "properties": {}}});
+        let (_, form, options) = elicit_question(&r);
+        let mut cases = vec![(Ask::Elicit { form, options }, "url mode")];
+        let (_, form, options) = elicit_question(&json!({"message": "m"}));
+        cases.push((Ask::Elicit { form, options }, "no schema"));
+        for (schema, why) in [
+            (
+                json!({"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}}),
+                "several",
+            ),
+            (
+                json!({"properties": {"ok": {"type": "boolean"}}}),
+                "no root type",
+            ),
+            (json!({"type": "string", "properties": {}}), "string root"),
+            (
+                json!({"type": "object", "properties": {"ok": {"type": "boolean", "enum": [true]}}}),
+                "boolean enum",
+            ),
+            (
+                json!({"type": "object", "properties": {"s": {"type": "string", "pattern": "^a"}}}),
+                "pattern",
+            ),
+            (
+                json!({"type": "object", "properties": {"c": {"type": "string", "enum": []}}}),
+                "empty enum",
+            ),
+        ] {
+            cases.push((ask(schema).1, why));
+        }
+        for (a, why) in cases {
+            let Ask::Elicit { options, .. } = &a else {
+                unreachable!()
+            };
+            assert_eq!(options, &vec![DECLINE.to_string()], "{why}");
+            for words in ["Accept", "yes", "No", r#"{"a":"1","b":"2"}"#, "0"] {
+                assert_eq!(
+                    response_for(&a, &Answer::Text(words.into())),
+                    json!({"action": "decline"}),
+                    "{why}: {words}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1690,6 +1988,11 @@ done
                     assert_eq!(session_id, id);
                     assert_eq!(options, vec!["Allow".to_string(), "Deny".to_string()]);
                     prompt = Some(prompt_id);
+                    // The waiting state reaches the saved roster and the panel.
+                    assert_eq!(
+                        next(&mut rx).await,
+                        RunnerEvent::RosterChanged { tool: KIND }
+                    );
                 }
                 ev => seen.push(ev),
             }
@@ -1702,6 +2005,7 @@ done
         assert_eq!(roster[0].session_id, id);
         assert_eq!(roster[0].name, "keo C123/1700000000.000100");
         assert_eq!(roster[0].state, SessionState::WaitingPermission);
+        assert!(roster[0].active_at > Some(0), "the panel orders by it");
         let prompt = prompt.unwrap();
         // A steer mid-turn waits and says so.
         assert!(matches!(
@@ -1719,13 +2023,17 @@ done
 
         let mut ended = None;
         let mut session_end = None;
+        let mut roster_changes = 0;
         while session_end.is_none() {
             match next(&mut rx).await {
                 RunnerEvent::TurnEnded { text, .. } => ended = Some(text),
                 RunnerEvent::SessionEnded { reason, .. } => session_end = Some(reason),
+                RunnerEvent::RosterChanged { .. } => roster_changes += 1,
                 _ => {}
             }
         }
+        // The answer (no longer waiting) and the turn's end (no longer working) each re-list.
+        assert!(roster_changes >= 2, "{roster_changes} roster changes");
         assert!(ended
             .flatten()
             .unwrap()
@@ -1734,7 +2042,7 @@ done
 
         let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
         for a in [
-            "-p --input-format stream-json --output-format stream-json --verbose --include-hook-events --permission-prompt-tool stdio",
+            "-p --input-format stream-json --output-format stream-json --verbose --include-hook-events --permission-prompt-tool stdio --permission-mode auto",
             &format!("--session-id {id}"),
             "--name keo C123/1700000000.000100",
             "--strict-mcp-config --mcp-config ",
@@ -1811,7 +2119,10 @@ done
             Pending {
                 session_id: "gone".into(),
                 request_id: "r1".into(),
-                ask: Ask::Tool { input: json!({}) },
+                ask: Ask::Tool {
+                    input: json!({}),
+                    allow: true,
+                },
             },
         );
         assert!(matches!(

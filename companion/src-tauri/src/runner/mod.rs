@@ -16,6 +16,7 @@ use crate::versions;
 
 pub mod claude;
 pub mod codex;
+pub mod form;
 
 /// The coding tools the companion knows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -123,6 +124,18 @@ pub struct RosterEntry {
     pub name: String,
     pub state: SessionState,
     pub pid: Option<u32>,
+    /// Last activity (Unix seconds), for the panel's order only: Keo never hears it, and a
+    /// change in it alone sends no event (`registry::diff`). Absent in an older state.json.
+    #[serde(default)]
+    pub active_at: Option<i64>,
+}
+
+/// Now, in Unix seconds.
+pub fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// A session's state, as Keo's `Register` event names it.
@@ -298,7 +311,7 @@ impl Default for SessionPolicy {
 /// Every runner, built in one place.
 pub fn all(policy: SessionPolicy) -> Vec<Arc<dyn Runner>> {
     vec![
-        Arc::new(codex::CodexRunner::new()),
+        Arc::new(codex::CodexRunner::with_policy(policy.clone())),
         Arc::new(claude::ClaudeRunner::with_options(claude::Options {
             policy,
             ..claude::Options::default()
@@ -463,6 +476,36 @@ pub fn classify(tool: ToolKind, path: PathBuf, version: Option<semver::Version>)
     }
 }
 
+/// Windows' `CREATE_NO_WINDOW`: a console program the app starts opens no window of its own
+/// (the release app has no console for it to share).
+#[cfg(windows)]
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// The length Keo measures a question by: UTF-16 code units, as the bridge's JavaScript
+/// `slice` counts them. A character outside the BMP (an emoji) is two.
+pub fn units(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+/// The longest prefix of `s` that fits `max` UTF-16 units, never splitting a character.
+pub fn prefix_units(s: &str, max: usize) -> &str {
+    let mut used = 0;
+    for (i, c) in s.char_indices() {
+        used += c.len_utf16();
+        if used > max {
+            return &s[..i];
+        }
+    }
+    s
+}
+
+/// Keep a tool the app starts in the background: no console window on Windows.
+pub fn no_window(cmd: &mut tokio::process::Command) -> &mut tokio::process::Command {
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
 /// Find the tool and run `<bin> --version` (5 s timeout).
 pub async fn detect_tool(tool: ToolKind) -> Detection {
     let Some(path) = find_binary(tool.binary()) else {
@@ -472,6 +515,7 @@ pub async fn detect_tool(tool: ToolKind) -> Detection {
         };
     };
     let mut cmd = tokio::process::Command::new(&path);
+    no_window(&mut cmd);
     if let Some(p) = child_path(&path) {
         cmd.env("PATH", p);
     }
@@ -501,6 +545,15 @@ pub async fn detect_tool(tool: ToolKind) -> Detection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn question_length_counts_bridge_units_whole_chars() {
+        assert_eq!(units("ab"), 2);
+        assert_eq!(units("😀"), 2);
+        assert_eq!(prefix_units("a😀b", 2), "a");
+        assert_eq!(prefix_units("a😀b", 3), "a😀");
+        assert_eq!(prefix_units("ab", 9), "ab");
+    }
 
     #[test]
     fn a_session_loads_only_the_keo_server_the_app_talks_to() {

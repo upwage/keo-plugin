@@ -5,9 +5,15 @@
 //!
 //! - Roster: `thread/list` (recent, not archived) with each thread's real `cwd`; a thread this
 //!   runner touched that fell off the page is read with `thread/read`.
-//! - Start: `thread/start {cwd, approvalPolicy:"on-request", sandbox:"workspace-write"}`, then
-//!   `thread/name/set`; the thread stays idle and off the roster until its first `send`.
-//! - Send: `thread/resume` when the thread is not loaded here, then `turn/start` (or
+//! - Start: `config/read {cwd}`, then `thread/start {cwd, approvalPolicy:"never",
+//!   sandbox:"workspace-write"}` with the person's other MCP servers and plugins off and network
+//!   on (`lean_config`), then `thread/name/set`. The Slack Allow that sent the work is the
+//!   person's one approval: Codex never asks per command, writes stay inside the approved folder
+//!   (the sandbox), and the network is open for fetches and installs. Each `turn/start` of a
+//!   thread the companion created says the same (`turn_policy`), so a resumed thread keeps it; a
+//!   person's own thread keeps its own approvals; the thread stays idle and off the roster until its first `send`.
+//! - Send: `thread/read` then `thread/resume` (a companion thread again with `lean_config`) when
+//!   the thread is not loaded here, then `turn/start` (or
 //!   `turn/steer` when a turn is running). Steer: `turn/steer {expectedTurnId}`. Stop:
 //!   `turn/interrupt`.
 //! - Server requests (approvals, user input, MCP elicitation) become `Question`s with a fresh v4
@@ -16,7 +22,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -25,8 +30,8 @@ use serde_json::{json, Map, Value};
 use tokio::sync::broadcast;
 
 use super::{
-    detect_tool, Answer, Detection, RosterEntry, Runner, RunnerError, RunnerEvent, StartRequest,
-    ToolKind, ToolStatus,
+    detect_tool, now_secs, Answer, Detection, RosterEntry, Runner, RunnerError, RunnerEvent,
+    SessionPolicy, StartRequest, ToolKind, ToolStatus,
 };
 
 mod map;
@@ -53,15 +58,115 @@ const GUI_PLUGINS: &[&str] = &[
     "browser@openai-bundled",
 ];
 
-/// `thread/start` config overrides (dotted keys, as `-c` takes them): the GUI plugins off, the
-/// rest of the person's config as it is.
-fn lean_config() -> Value {
-    Value::Object(
-        GUI_PLUGINS
-            .iter()
-            .map(|p| (format!("plugins.{p}.enabled"), Value::Bool(false)))
-            .collect(),
-    )
+/// The full id (`name@marketplace`) of Keo's own Codex plugin for the policy's Keo origin, as
+/// this repo's Codex marketplaces ship them: `keo@keo-plugin` for production, and the team's
+/// variant `keo-<sub>@keo-<sub>` for the `<sub>` subdomain. It is the only plugin a Keo-started
+/// session keeps, since its one MCP server is that Keo's; Keo's plugin for another origin, or a
+/// plugin of the same name from any other marketplace, is switched off.
+fn keo_plugin(policy: &SessionPolicy) -> Option<String> {
+    let prod = SessionPolicy::default();
+    if policy.is_keo_url(&prod.keo_mcp_url) {
+        return Some("keo@keo-plugin".into());
+    }
+    let prod_host = url::Url::parse(&prod.keo_mcp_url)
+        .ok()?
+        .host_str()?
+        .to_string();
+    let host = url::Url::parse(&policy.keo_mcp_url)
+        .ok()?
+        .host_str()?
+        .to_string();
+    let sub = host.strip_suffix(&format!(".{prod_host}"))?;
+    (!sub.is_empty() && !sub.contains('.')).then(|| format!("keo-{sub}@keo-{sub}"))
+}
+
+/// Config overrides (dotted keys, as `-c` takes them) for a Keo-started thread, from the
+/// person's effective config in its folder (the `config` of a `config/read` reply), held to
+/// `SessionPolicy`: every MCP server off but their own entry for Keo's URL, every plugin off but
+/// Keo's own (a plugin can bring MCP servers), the ChatGPT apps connectors off, and network on in
+/// the workspace-write sandbox. With no Keo plugin on, plugins are off as a whole too
+/// (`features.plugins`), so one added after the read stays off. Codex has no such switch for MCP
+/// servers, so each is named, and only servers the config names: Codex refuses an override for a
+/// server it does not have. A config that is not an object, a collection or entry of the wrong
+/// shape, or a name a dotted key cannot hold is an error: the session never starts with a server
+/// it could not switch off.
+fn lean_config(config: &Value, policy: &SessionPolicy) -> Result<Value, String> {
+    let config = config
+        .as_object()
+        .ok_or("the config/read reply holds no config object")?;
+    let collection = |key: &str| -> Result<Option<&Map<String, Value>>, String> {
+        match config.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Object(m)) => Ok(Some(m)),
+            Some(_) => Err(format!("`{key}` in the config is not a table")),
+        }
+    };
+    let mut out: Map<String, Value> = GUI_PLUGINS
+        .iter()
+        .map(|p| (format!("plugins.{p}.enabled"), Value::Bool(false)))
+        .collect();
+    let addressable = |name: &str| !name.is_empty() && !name.contains(['.', '"', '\\']);
+    let enabled = |entry: &Map<String, Value>| match entry.get("enabled") {
+        None | Some(Value::Null) => Ok(true),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err("an `enabled` that is not true or false"),
+    };
+    for (name, server) in collection("mcp_servers")?.into_iter().flatten() {
+        let server = server
+            .as_object()
+            .ok_or_else(|| format!("MCP server {name:?} is not a table"))?;
+        let keo = server
+            .get("url")
+            .and_then(Value::as_str)
+            .is_some_and(|u| policy.is_keo_url(u));
+        if keo || !enabled(server).map_err(|e| format!("MCP server {name:?} has {e}"))? {
+            continue;
+        }
+        if !addressable(name) {
+            return Err(format!("MCP server {name:?} cannot be switched off"));
+        }
+        out.insert(format!("mcp_servers.{name}.enabled"), Value::Bool(false));
+    }
+    let keo_id = keo_plugin(policy);
+    let mut keo_plugin = false;
+    for (id, plugin) in collection("plugins")?.into_iter().flatten() {
+        let plugin = plugin
+            .as_object()
+            .ok_or_else(|| format!("plugin {id:?} is not a table"))?;
+        let on = enabled(plugin).map_err(|e| format!("plugin {id:?} has {e}"))?;
+        if keo_id.as_deref() == Some(id.as_str()) {
+            keo_plugin |= on;
+            continue;
+        }
+        if !addressable(id) {
+            return Err(format!("plugin {id:?} cannot be switched off"));
+        }
+        out.insert(format!("plugins.{id}.enabled"), Value::Bool(false));
+    }
+    if !keo_plugin {
+        out.insert("features.plugins".into(), Value::Bool(false));
+    }
+    out.insert("features.apps".into(), Value::Bool(false));
+    out.insert(
+        "sandbox_workspace_write.network_access".into(),
+        Value::Bool(true),
+    );
+    Ok(Value::Object(out))
+}
+
+/// The app-server client name; Codex records it as each new thread's `originator`.
+const CLIENT_NAME: &str = "keo-companion";
+
+/// Approval policy of a Keo-started turn: the Slack Allow was the approval, so Codex never asks.
+const APPROVAL_POLICY: &str = "never";
+
+/// The per-turn overrides a Keo-started thread's `turn/start` carries (they stay for the thread's
+/// later turns): no approvals, writes inside the thread's folder, network on.
+fn turn_policy() -> Value {
+    json!({
+        "approvalPolicy": APPROVAL_POLICY,
+        "sandboxPolicy": {"type": "workspaceWrite", "networkAccess": true},
+    })
 }
 
 /// JSON-RPC internal error: the server failed, not the thread.
@@ -124,8 +229,12 @@ struct Live {
     done_turn: Option<String>,
     status: Option<String>,
     last_message: Option<String>,
-    /// Files an `item/started` file change named, by item id, for the approval's text.
-    changes: HashMap<String, Vec<String>>,
+    /// The changes an `item/started` file change holds (`map::change_details`), by item id, for
+    /// the approval's text, keyed by (connection generation, item id): every event reads, writes
+    /// and removes only its own connection's entries, so a late frame from a closed connection
+    /// never touches a newer one. They go when the item or turn completes, the thread closes, or
+    /// the connection closes.
+    changes: HashMap<(u64, String), Vec<String>>,
 }
 
 #[derive(Default)]
@@ -141,14 +250,21 @@ struct State {
     /// inbox's Register is the first Keo hears of them. The flag says the name may still take a
     /// ticket key from the first words.
     unsent: HashMap<String, bool>,
+    /// Threads the companion created (`thread/start` here, or `originator` `CLIENT_NAME` on
+    /// resume): only these get `turn_policy`. A person's own thread keeps its own approvals.
+    keo_started: HashSet<String>,
 }
 
 struct Inner {
     events: broadcast::Sender<RunnerEvent>,
     launch: Launch,
+    policy: SessionPolicy,
     conn: tokio::sync::Mutex<Option<(u64, Arc<Conn>)>>,
     child: Mutex<Option<server::Server>>,
-    generation: AtomicU64,
+    /// The newest connection's generation. `pump` holds this lock from its check through the
+    /// handler, and `conn` holds it to promote a new connection, so a frame that passed the check
+    /// is handled before any newer generation exists.
+    generation: Mutex<u64>,
     question_timeout: Duration,
     st: Mutex<State>,
     /// `start` holds it for writing from `thread/start` until the new id is in `unsent`; `list`
@@ -164,18 +280,23 @@ pub struct CodexRunner {
 
 impl CodexRunner {
     pub fn new() -> Self {
-        Self::build(Launch::Auto, QUESTION_TIMEOUT)
+        Self::with_policy(SessionPolicy::default())
     }
 
-    fn build(launch: Launch, question_timeout: Duration) -> Self {
+    pub fn with_policy(policy: SessionPolicy) -> Self {
+        Self::build(Launch::Auto, policy, QUESTION_TIMEOUT)
+    }
+
+    fn build(launch: Launch, policy: SessionPolicy, question_timeout: Duration) -> Self {
         let (events, _) = broadcast::channel(256);
         Self {
             inner: Arc::new(Inner {
                 events,
                 launch,
+                policy,
                 conn: tokio::sync::Mutex::new(None),
                 child: Mutex::new(None),
-                generation: AtomicU64::new(0),
+                generation: Mutex::new(0),
                 question_timeout,
                 st: Mutex::new(State::default()),
                 creating: tokio::sync::RwLock::new(()),
@@ -185,7 +306,11 @@ impl CodexRunner {
 
     #[cfg(test)]
     fn fixed(url: String, token: String, question_timeout: Duration) -> Self {
-        Self::build(Launch::Fixed { url, token }, question_timeout)
+        Self::build(
+            Launch::Fixed { url, token },
+            SessionPolicy::default(),
+            question_timeout,
+        )
     }
 }
 
@@ -221,13 +346,17 @@ impl Inner {
             }
         }
         let (conn, inbound) = self.open().await?;
-        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let generation = {
+            let mut g = self.generation.lock().expect("codex generation lock");
+            *g += 1;
+            *g
+        };
         let init = conn
             .call(
                 "initialize",
                 json!({
                     "clientInfo": {
-                        "name": "keo-companion",
+                        "name": CLIENT_NAME,
                         "title": "Keo Companion",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
@@ -316,6 +445,7 @@ impl Inner {
         {
             let mut st = self.st();
             for (id, live) in st.threads.iter_mut() {
+                live.changes.retain(|(g, _), _| *g != generation);
                 if live.loaded == generation {
                     live.loaded = 0;
                     if live.turn.take().is_some() {
@@ -374,7 +504,7 @@ impl Inner {
                         .pointer("/turn/id")
                         .and_then(Value::as_str)
                         .map(str::to_string);
-                    live.changes.clear();
+                    live.changes.retain(|(g, _), _| *g != generation);
                     let last = live.last_message.take();
                     let stale: Vec<String> = st
                         .prompts
@@ -399,13 +529,15 @@ impl Inner {
                 };
                 if item.get("type").and_then(Value::as_str) == Some("fileChange") {
                     if let Some(id) = item.get("id").and_then(Value::as_str) {
-                        let paths = map::change_paths(item);
+                        // Each change in full, for the approval's text; none when one cannot be
+                        // shown as it is, so the approval stays deny-only.
+                        let paths = map::change_details(item).unwrap_or_default();
                         self.st()
                             .threads
                             .entry(t)
                             .or_default()
                             .changes
-                            .insert(id.to_string(), paths);
+                            .insert((generation, id.to_string()), paths);
                     }
                 }
             }
@@ -413,6 +545,11 @@ impl Inner {
                 let (Some(t), Some(item)) = (thread_id, p.get("item")) else {
                     return;
                 };
+                if let Some(id) = item.get("id").and_then(Value::as_str) {
+                    if let Some(live) = self.st().threads.get_mut(&t) {
+                        live.changes.remove(&(generation, id.to_string()));
+                    }
+                }
                 if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
                     if let Some(text) = item.get("text").and_then(Value::as_str) {
                         self.st().threads.entry(t.clone()).or_default().last_message =
@@ -454,6 +591,7 @@ impl Inner {
                 if let Some(t) = thread_id {
                     if let Some(live) = self.st().threads.get_mut(&t) {
                         live.loaded = 0;
+                        live.changes.retain(|(g, _), _| *g != generation);
                     }
                 }
             }
@@ -550,7 +688,13 @@ impl Inner {
             let st = self.st();
             p.get("itemId")
                 .and_then(Value::as_str)
-                .and_then(|item| st.threads.get(&session_id)?.changes.get(item).cloned())
+                .and_then(|item| {
+                    st.threads
+                        .get(&session_id)?
+                        .changes
+                        .get(&(generation, item.to_string()))
+                        .cloned()
+                })
                 .unwrap_or_default()
         };
         let Some(built) = map::questions(method, p, &files) else {
@@ -684,17 +828,36 @@ impl Inner {
             .get(session_id)
             .is_some_and(|l| l.loaded == generation);
         if !loaded {
-            let res = conn
+            let no_session = |e| match e {
+                RpcError::Server { .. } => RunnerError::NoSession(session_id.to_string()),
+                e => failed(e),
+            };
+            // Read first: a thread the companion created is resumed held to `SessionPolicy`
+            // again (the overrides belong to a load, not to the thread), and its one-Allow
+            // policy is kept after a restart.
+            let read = conn
                 .call(
-                    "thread/resume",
-                    json!({"threadId": session_id, "excludeTurns": true}),
+                    "thread/read",
+                    json!({"threadId": session_id, "includeTurns": false}),
                     CALL_TIMEOUT,
                 )
                 .await
-                .map_err(|e| match e {
-                    RpcError::Server { .. } => RunnerError::NoSession(session_id.to_string()),
-                    e => failed(e),
-                })?;
+                .map_err(no_session)?;
+            let ours = self.st().keo_started.contains(session_id)
+                || read.pointer("/thread/originator").and_then(Value::as_str) == Some(CLIENT_NAME);
+            let mut params = json!({"threadId": session_id, "excludeTurns": true});
+            if ours {
+                let cwd = read
+                    .get("thread")
+                    .and_then(map::thread_cwd)
+                    .ok_or_else(|| RunnerError::Failed("Codex gave the thread no folder".into()))?;
+                params["config"] = self.session_config(&conn, &cwd).await?;
+                self.st().keo_started.insert(session_id.to_string());
+            }
+            let res = conn
+                .call("thread/resume", params, CALL_TIMEOUT)
+                .await
+                .map_err(no_session)?;
             // `excludeTurns` leaves `thread.turns` empty: a thread resumed mid-turn (after a
             // companion restart, say) is found by its status, and its turn read from the newest page.
             let active =
@@ -733,6 +896,19 @@ impl Inner {
         Ok(conn)
     }
 
+    /// The overrides that hold a Keo-started thread in `cwd` to `SessionPolicy` (`lean_config`).
+    /// A config that cannot be read fails the start: the session never runs with the person's
+    /// other MCP servers.
+    async fn session_config(&self, conn: &Conn, cwd: &str) -> Result<Value, RunnerError> {
+        let read = conn
+            .call("config/read", json!({"cwd": cwd}), CALL_TIMEOUT)
+            .await
+            .map_err(|e| RunnerError::Failed(format!("Codex config not read: {e}")))?;
+        // A reply with no config object fails closed in `lean_config`, never reads as empty.
+        lean_config(read.get("config").unwrap_or(&Value::Null), &self.policy)
+            .map_err(|e| RunnerError::Failed(format!("Codex session not isolated: {e}")))
+    }
+
     /// `thread/name/set`; a failed name is logged, not fatal.
     async fn set_name(&self, conn: &Conn, id: &str, name: &str) {
         if let Err(e) = conn
@@ -756,7 +932,13 @@ impl Inner {
         let res = conn
             .call(
                 "turn/start",
-                json!({"threadId": session_id, "input": text_input(text)}),
+                {
+                    let ours = self.st().keo_started.contains(session_id);
+                    let mut params = if ours { turn_policy() } else { json!({}) };
+                    params["threadId"] = json!(session_id);
+                    params["input"] = text_input(text);
+                    params
+                },
                 CALL_TIMEOUT,
             )
             .await
@@ -769,6 +951,27 @@ impl Inner {
             }
         }
         Ok(())
+    }
+
+    /// `text` as the next message: steering the running turn, else a new `turn/start`.
+    async fn deliver(&self, conn: &Conn, session_id: &str, text: &str) -> Result<(), RunnerError> {
+        let running = self
+            .st()
+            .threads
+            .get(session_id)
+            .and_then(|l| l.turn.clone());
+        if let Some(turn) = running {
+            match self.steer_turn(conn, session_id, text, turn).await {
+                // The turn ended meanwhile (an interrupt answers before its turn/completed).
+                Err(RunnerError::Failed(m)) if m.contains("no active turn") => {
+                    if let Some(live) = self.st().threads.get_mut(session_id) {
+                        live.turn = None;
+                    }
+                }
+                other => return other,
+            }
+        }
+        self.turn_start(conn, session_id, text).await
     }
 
     async fn steer_turn(
@@ -807,6 +1010,10 @@ impl Inner {
 
 /// Handle everything one connection sends, then clean up after it closes. It holds the runner
 /// weakly, so a dropped runner (and the app-server it started) is not kept alive by its socket.
+///
+/// This is the one place a frame reaches a handler, so it is the one place a stale frame is
+/// dropped: once a newer connection is made, whatever the old one still had buffered (a turn's
+/// end, an approval ask) describes a server state that is gone, and no handler sees it.
 async fn pump(
     inner: std::sync::Weak<Inner>,
     generation: u64,
@@ -815,6 +1022,16 @@ async fn pump(
 ) {
     while let Some(msg) = inbound.recv().await {
         let Some(me) = inner.upgrade() else { return };
+        // The check and the handler run under one hold of the generation lock (the handlers are
+        // synchronous), so no newer connection can be promoted between them.
+        let current = me.generation.lock().expect("codex generation lock");
+        if *current != generation {
+            tracing::debug!(
+                generation,
+                "codex: dropped a frame from a closed connection"
+            );
+            continue;
+        }
         match msg {
             Inbound::Notification { method, params } => {
                 me.on_notification(generation, &method, &params)
@@ -823,6 +1040,7 @@ async fn pump(
                 me.on_request(generation, &conn, id, &method, &params)
             }
         }
+        drop(current);
     }
     if let Some(me) = inner.upgrade() {
         me.on_closed(generation);
@@ -877,11 +1095,7 @@ impl Runner for CodexRunner {
             (st.touched.clone(), st.unsent.keys().cloned().collect())
         };
         drop(creating);
-        let since = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
-            - ROSTER_DAYS * 86_400;
+        let since = now_secs() - ROSTER_DAYS * 86_400;
         let mut out: Vec<RosterEntry> = threads
             .iter()
             .filter(|t| {
@@ -932,15 +1146,16 @@ impl Runner for CodexRunner {
     async fn start(&self, req: StartRequest) -> Result<String, RunnerError> {
         let (generation, conn) = self.inner.conn().await?;
         let cwd = req.cwd.to_string_lossy().to_string();
+        let config = self.inner.session_config(&conn, &cwd).await?;
         let creating = self.inner.creating.write().await;
         let res = conn
             .call(
                 "thread/start",
                 json!({
                     "cwd": cwd,
-                    "approvalPolicy": "on-request",
+                    "approvalPolicy": APPROVAL_POLICY,
                     "sandbox": "workspace-write",
-                    "config": lean_config(),
+                    "config": config,
                 }),
                 CALL_TIMEOUT,
             )
@@ -957,6 +1172,7 @@ impl Runner for CodexRunner {
             let mut st = self.inner.st();
             st.threads.entry(id.clone()).or_default().loaded = generation;
             st.unsent.insert(id.clone(), named.is_none());
+            st.keo_started.insert(id.clone());
         }
         drop(creating);
         let name = named.unwrap_or_else(|| map::start_name("", req.slack_thread.as_deref()));
@@ -966,38 +1182,21 @@ impl Runner for CodexRunner {
 
     async fn send(&self, session_id: &str, text: &str) -> Result<(), RunnerError> {
         let conn = self.inner.ensure_loaded(session_id).await?;
-        // A session `start` opened gets its first words: it joins the roster now.
-        let first = {
-            let mut st = self.inner.st();
-            let first = st.unsent.remove(session_id);
-            if first.is_some() {
-                st.touched.insert(session_id.to_string());
-            }
-            first
-        };
+        let first = self.inner.st().unsent.get(session_id).copied();
         if first == Some(true) {
             if let Some(key) = map::ticket_key(text) {
                 self.inner.set_name(&conn, session_id, &key).await;
             }
         }
-        let running = self
-            .inner
-            .st()
-            .threads
-            .get(session_id)
-            .and_then(|l| l.turn.clone());
-        if let Some(turn) = running {
-            match self.inner.steer_turn(&conn, session_id, text, turn).await {
-                // The turn ended meanwhile (an interrupt answers before its turn/completed).
-                Err(RunnerError::Failed(m)) if m.contains("no active turn") => {
-                    if let Some(live) = self.inner.st().threads.get_mut(session_id) {
-                        live.turn = None;
-                    }
-                }
-                other => return other,
-            }
+        let sent = self.inner.deliver(&conn, session_id, text).await;
+        // A session `start` opened joins the roster once its first words are in. Until then it
+        // stays unsent, so a failed first send still lets `close` archive it.
+        if first.is_some() && sent.is_ok() {
+            let mut st = self.inner.st();
+            st.unsent.remove(session_id);
+            st.touched.insert(session_id.to_string());
         }
-        self.inner.turn_start(&conn, session_id, text).await
+        sent
     }
 
     async fn steer(&self, session_id: &str, text: &str) -> Result<(), RunnerError> {
@@ -1011,7 +1210,6 @@ impl Runner for CodexRunner {
             .ok_or_else(|| RunnerError::Failed("no running turn to steer".into()))?;
         self.inner.steer_turn(&conn, session_id, text, turn).await
     }
-
     async fn interrupt(&self, session_id: &str) -> Result<(), RunnerError> {
         let conn = self.inner.ensure_loaded(session_id).await?;
         let turn = self
@@ -1047,6 +1245,7 @@ impl Runner for CodexRunner {
             .map_err(failed);
         let mut st = self.inner.st();
         st.unsent.remove(session_id);
+        st.touched.remove(session_id);
         st.threads.remove(session_id);
         res
     }

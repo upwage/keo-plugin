@@ -2,8 +2,9 @@
 //! showed `codex app-server daemon` serves only a unix control socket, and the desktop app's
 //! app-server is stdio-only, so the companion always starts its own. Every start writes a new
 //! token to `codex.token` (0600), so a token is only ever sent to the server it was made for. The
-//! server's pid is kept in `codex.pid`: a server an earlier launch left running is stopped, never
-//! attached to, since nothing proves a listener on an old port is still that server.
+//! server's pid is kept in `codex.pid` with the process's start time: a server an earlier launch
+//! left running is stopped, never attached to, since nothing proves a listener on an old port is
+//! still that server. The start time proves the pid was not reused by another process since.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -13,7 +14,7 @@ use rand::RngCore;
 
 pub const TOKEN_FILE: &str = "codex.token";
 pub const PID_FILE: &str = "codex.pid";
-pub const LOG_FILE: &str = "codex-app-server.log";
+pub const LOG_FILE: &str = crate::log::CODEX_SERVER_LOG;
 /// How long a new server may take to answer `/readyz`.
 const READY_WAIT: Duration = Duration::from_secs(20);
 
@@ -48,22 +49,47 @@ fn restrict(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn saved_pid(dir: &Path) -> Option<u32> {
-    std::fs::read_to_string(dir.join(PID_FILE))
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .filter(|&p| p > 1)
+/// The saved pid and, on its second line, the start time read when it was saved.
+fn saved_pid(dir: &Path) -> Option<(u32, Option<String>)> {
+    let text = std::fs::read_to_string(dir.join(PID_FILE)).ok()?;
+    let mut lines = text.lines();
+    let pid = lines.next()?.trim().parse().ok().filter(|&p: &u32| p > 1)?;
+    let started = lines
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Some((pid, started))
 }
 
 fn save_pid(dir: &Path, pid: u32) -> std::io::Result<()> {
-    std::fs::write(dir.join(PID_FILE), pid.to_string())
+    let started = started_at(pid).unwrap_or_default();
+    std::fs::write(dir.join(PID_FILE), format!("{pid}\n{started}"))
+}
+
+/// Whether the process at a saved pid is still the one saved: same start time. A file with no
+/// start time (an older build's, or one whose read failed) leaves only the command-line check.
+fn same_process(saved: Option<&str>, now: Option<&str>) -> bool {
+    match saved {
+        Some(s) => now == Some(s),
+        None => true,
+    }
 }
 
 /// Stop the app-server an earlier launch left running (with every process it started), when
-/// the saved pid is still a `codex app-server`.
+/// the saved pid is still that process (same start time) and a `codex app-server`.
 pub fn stop_stale(dir: &Path) {
-    let Some(pid) = saved_pid(dir) else { return };
+    let Some((pid, started)) = saved_pid(dir) else {
+        return;
+    };
     let _ = std::fs::remove_file(dir.join(PID_FILE));
+    if !same_process(started.as_deref(), started_at(pid).as_deref()) {
+        tracing::info!(
+            pid,
+            "codex: the saved app-server pid now names another process; left alone"
+        );
+        return;
+    }
     if is_app_server(&command_of(pid)) {
         tracing::info!(pid, "codex: stopping the app-server an earlier launch left");
         kill_tree(pid);
@@ -82,10 +108,34 @@ fn quiet(program: &str) -> std::process::Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.creation_flags(crate::runner::CREATE_NO_WINDOW);
     }
     cmd
+}
+
+/// When a running process started, as the system prints it; `None` when it is not running.
+fn started_at(pid: u32) -> Option<String> {
+    #[cfg(unix)]
+    let out = quiet("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .output();
+    #[cfg(windows)]
+    let out = quiet("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CreationDate.ToString('o')"
+            ),
+        ])
+        .output();
+    #[cfg(not(any(unix, windows)))]
+    let out: std::io::Result<std::process::Output> =
+        Err(std::io::Error::other("unsupported platform"));
+    out.ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// The command line of a running process, or empty.
@@ -177,7 +227,7 @@ impl Drop for Server {
     fn drop(&mut self) {
         if let Some(pid) = self.child.id() {
             kill_tree(pid);
-            if saved_pid(&self.dir) == Some(pid) {
+            if saved_pid(&self.dir).is_some_and(|(p, _)| p == pid) {
                 let _ = std::fs::remove_file(self.dir.join(PID_FILE));
             }
         }
@@ -191,13 +241,11 @@ pub async fn spawn(bin: &Path, dir: &Path, log_dir: &Path) -> Result<Server, Str
     let (token_file, token) = new_token(dir).map_err(|e| format!("codex token: {e}"))?;
     let port = free_port().map_err(|e| format!("no free port: {e}"))?;
     std::fs::create_dir_all(log_dir).map_err(|e| e.to_string())?;
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_dir.join(LOG_FILE))
+    let log = crate::log::open_capped(&log_dir.join(LOG_FILE), crate::log::CODEX_SERVER_LOG_MAX)
         .map_err(|e| e.to_string())?;
     let err = log.try_clone().map_err(|e| e.to_string())?;
     let mut cmd = tokio::process::Command::new(bin);
+    crate::runner::no_window(&mut cmd);
     if let Some(p) = crate::runner::child_path(bin) {
         cmd.env("PATH", p);
     }
@@ -273,8 +321,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         stop_stale(dir.path());
         save_pid(dir.path(), std::process::id()).unwrap();
+        #[cfg(unix)]
+        {
+            // The pid is saved with this process's start time, which still matches.
+            let (pid, started) = saved_pid(dir.path()).unwrap();
+            assert_eq!(pid, std::process::id());
+            assert!(started.is_some());
+            assert!(same_process(started.as_deref(), started_at(pid).as_deref()));
+        }
         stop_stale(dir.path());
         assert_eq!(saved_pid(dir.path()), None);
+        // A reused pid (another start time) is left alone; an older file has no start time.
+        assert!(!same_process(
+            Some("Mon Nov  2 10:00:00 2026"),
+            Some("Tue Nov  3 09:00:00 2026")
+        ));
+        assert!(!same_process(Some("Mon Nov  2 10:00:00 2026"), None));
+        assert!(same_process(None, Some("Tue Nov  3 09:00:00 2026")));
+        std::fs::write(dir.path().join(PID_FILE), "4242").unwrap();
+        assert_eq!(saved_pid(dir.path()), Some((4242, None)));
         assert_eq!(ws_url(45123), "ws://127.0.0.1:45123");
     }
 }

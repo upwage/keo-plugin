@@ -6,7 +6,7 @@
 // same signature, so the keychain asks for its password once and not on every build (DEV.md).
 //
 // The identity is, in order: APPLE_SIGNING_IDENTITY, `bundle.macOS.signingIdentity` in
-// src-tauri/tauri.conf.json, the first "Developer ID Application" identity in the keychain, then
+// src-tauri/tauri.conf.json (overridden by any `--config` file or JSON given to this script), the first "Developer ID Application" identity in the keychain, then
 // the first "Apple Development" one. With none, or with APPLE_SIGNING_IDENTITY set to "-", the
 // build keeps the linker's ad-hoc signature, and the keychain asks again after every build.
 import { execFileSync, spawn } from 'node:child_process';
@@ -18,6 +18,26 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
+/** The `bundle.macOS.signingIdentity` Tauri would see: the base config, then each `--config` in order. */
+function configuredIdentity(args) {
+  const read = (v) => {
+    try {
+      return JSON.parse(v.trim().startsWith('{') ? v : readFileSync(resolve(ROOT, v), 'utf8'));
+    } catch {
+      return null;
+    }
+  };
+  let identity = read(join(ROOT, 'src-tauri/tauri.conf.json'))?.bundle?.macOS?.signingIdentity;
+  for (let i = 0; i < args.length; i++) {
+    const m = /^(?:-c|--config)(?:=(.*))?$/.exec(args[i]);
+    if (!m) continue;
+    const value = m[1] ?? args[++i];
+    const found = value && read(value)?.bundle?.macOS?.signingIdentity;
+    if (found !== undefined && found !== null) identity = found;
+  }
+  return identity;
+}
+
 /**
  * The identity to sign dev builds with, as `{ sign, name }`, or null for the ad-hoc signature. An
  * identity found in the keychain is signed by its SHA-1: two certificates can share a name (after a
@@ -26,8 +46,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 function signingIdentity() {
   const fromEnv = process.env.APPLE_SIGNING_IDENTITY;
   if (fromEnv) return fromEnv === '-' ? null : { sign: fromEnv, name: fromEnv };
-  const config = JSON.parse(readFileSync(join(ROOT, 'src-tauri/tauri.conf.json'), 'utf8'));
-  const fromConfig = config.bundle?.macOS?.signingIdentity;
+  const fromConfig = configuredIdentity(process.argv.slice(2));
   if (fromConfig && fromConfig !== '-') return { sign: fromConfig, name: fromConfig };
   let listed = '';
   try {
