@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Keo Companion</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script type="module" src="main.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="title">Keo Companion</div>
+        <div id="status" class="status" role="status">Starting</div>
+        <div id="error" class="error" hidden></div>
+        <div class="row">
+          <button id="sign-in" type="button">Sign in with Keo</button>
+          <button id="sign-out" type="button" class="secondary" hidden>Sign out</button>
+          <button id="cancel-sign-in" type="button" class="secondary" hidden>Cancel</button>
+        </div>
+        <div class="switches">
+          <label class="switch"><input id="paused" type="checkbox" /> Pause (Keo cannot start or message sessions)</label>
+          <label class="switch"><input id="start-at-login" type="checkbox" /> Start at login</label>
+        </div>
+      </header>
+
+      <section>
+        <h2>Coding tools and sessions</h2>
+        <ul id="tools" class="list"></ul>
+        <ul id="sessions" class="list"></ul>
+        <p id="more-sessions" class="muted" hidden></p>
+        <p id="no-sessions" class="muted">No sessions yet.</p>
+      </section>
+
+      <section>
+        <h2>Approved folders</h2>
+        <p class="muted">Keo can only run tasks inside these folders.</p>
+        <ul id="dirs" class="list"></ul>
+        <form id="add-dir" class="row">
+          <input id="dir-input" type="text" placeholder="~/code/project" spellcheck="false" autocomplete="off" />
+          <button type="submit">Add</button>
+        </form>
+        <div id="dir-error" class="error field-error" role="alert" hidden></div>
+      </section>
+
+      <section>
+        <h2>Log <button id="log-refresh" type="button" class="link">Refresh</button></h2>
+        <pre id="log" class="log"></pre>
+      </section>
+
+      <section class="about">
+        <h2>About</h2>
+        <p id="version" class="muted"></p>
+        <p>Hosts: askkeo.ai only, plus the update check (askkeo.ai, then the release manifest on github.com/upwage/keo-plugin).</p>
+        <p>What it sends: session ids, the task text you approved in Slack, tool events, usage numbers, and, for a session Keo started or sent work to, its progress notes, its questions and its last reply. Those can quote code or files from that session.</p>
+        <p>No full transcripts, no files read off disk, no vendor tokens. Sessions Keo did not hand work to are never relayed.</p>
+        <button id="quit" type="button" class="secondary">Quit Keo Companion</button>
+      </section>
+    </main>
+  </body>
+</html>
